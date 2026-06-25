@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-label="AJRM Marine Logger">
+  <rect width="120" height="120" rx="22" fill="#102033"/>
+  <circle cx="60" cy="60" r="38" fill="none" stroke="#69d2e7" stroke-width="8"/>
+  <circle cx="60" cy="60" r="16" fill="#ff4f5e"/>
+  <path d="M60 18v15M60 87v15M18 60h15M87 60h15" stroke="#f9fbff" stroke-width="8" stroke-linecap="round"/>
+  <path d="M82 82l18 18" stroke="#69d2e7" stroke-width="8" stroke-linecap="round"/>
+</svg>

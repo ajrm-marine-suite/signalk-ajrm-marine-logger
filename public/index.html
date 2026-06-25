@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AJRM Marine Logger</title>
+    <link rel="stylesheet" href="/signalk-ajrm-marine-logger/styles.css?v=1.2.2" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">Signal K</p>
+          <h1>AJRM Marine Logger</h1>
+        </div>
+        <div class="header-actions">
+          <button id="settingsButton" type="button" class="secondary">Settings</button>
+          <button id="refreshButton" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <section id="statusBanner" class="banner">Loading...</section>
+
+      <section id="settingsPanel" class="panel settings-panel hidden">
+        <h2>Settings</h2>
+        <div class="settings-grid">
+          <label
+            class="inline-field"
+            title="When a capture starts, include this many minutes already held in the rolling buffer."
+          >
+            Pre-Capture Time
+            <input
+              id="backfillMinutes"
+              type="number"
+              min="0"
+              max="1440"
+              value="30"
+              title="When a capture starts, include this many minutes already held in the rolling buffer."
+            />
+            <span>min</span>
+          </label>
+          <label
+            class="inline-field"
+            title="Start a new log file after this many minutes. Use a small value for testing; 60 minutes is the normal default."
+          >
+            Log cycle
+            <input
+              id="captureSegmentMinutes"
+              type="number"
+              min="1"
+              max="1440"
+              value="60"
+              title="Start a new log file after this many minutes. Use a small value for testing; 60 minutes is the normal default."
+            />
+            <span>min</span>
+          </label>
+          <label class="check-field">
+            <input id="autoStartCapture" type="checkbox" />
+            <span>Auto-start capture</span>
+          </label>
+          <label class="check-field">
+            <input id="autoAdvancePlayback" type="checkbox" />
+            <span>Auto-play next file</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="panel primary">
+        <div>
+          <h2>Capture</h2>
+          <p id="captureStatus">Rolling buffer starting...</p>
+        </div>
+        <div class="actions">
+          <button id="startCaptureButton" type="button">Start Capture</button>
+          <button id="stopCaptureButton" type="button" class="secondary">Stop Capture</button>
+        </div>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <h2>Files</h2>
+          <div class="tabs" role="tablist" aria-label="File browser">
+            <button id="logsTab" type="button" class="tab active">Logs</button>
+            <button id="clipsTab" type="button" class="tab secondary">Clips</button>
+            <button id="voyagesTab" type="button" class="tab secondary">Voyages</button>
+          </div>
+          <div class="selected-file-actions" aria-label="Selected file actions">
+            <button id="loadSelectedButton" type="button" disabled>Load</button>
+            <a id="downloadSelectedFile" class="download-file disabled" href="#" download aria-disabled="true">Download</a>
+            <button id="deleteSelectedButton" type="button" class="delete-file" disabled>Delete</button>
+          </div>
+          <p id="selectedFileInfo" class="selected-file-info">Select a log, clip, or voyage.</p>
+          <div id="captureList" class="recording-list"></div>
+        </article>
+
+        <article class="panel">
+          <h2>Playback</h2>
+          <dl class="compact">
+            <div><dt>Loaded</dt><dd id="loadedFile">-</dd></div>
+            <div><dt>Recording Time</dt><dd id="playbackTime">-</dd></div>
+            <div><dt>Progress</dt><dd id="playbackProgress">-</dd></div>
+          </dl>
+          <input id="seekSlider" type="range" min="0" max="1000" value="0" />
+          <div class="transport">
+            <button id="rewindButton" type="button">-1 min</button>
+            <button id="playButton" type="button">Play</button>
+            <button id="pauseButton" type="button">Pause</button>
+            <button id="forwardButton" type="button">+1 min</button>
+            <button id="stopPlaybackButton" type="button">Stop</button>
+          </div>
+          <label class="compact-field">
+            <span>Speed</span>
+            <select id="playbackRate">
+              <option value="0.5">0.5x</option>
+              <option value="1" selected>1x</option>
+              <option value="2">2x</option>
+              <option value="5">5x</option>
+              <option value="10">10x</option>
+            </select>
+          </label>
+        </article>
+
+        <article class="panel">
+          <h2>Save Clip</h2>
+          <label>
+            Name
+            <input id="clipLabel" value="clip" />
+          </label>
+          <label>
+            From
+            <input id="clipFrom" type="datetime-local" />
+          </label>
+          <label>
+            To
+            <input id="clipTo" type="datetime-local" />
+          </label>
+          <button id="extractButton" type="button">Save as Clip</button>
+        </article>
+
+        <article class="panel">
+          <h2>Status</h2>
+          <dl class="compact">
+            <div><dt>Buffer</dt><dd id="bufferStatus">-</dd></div>
+            <div><dt>Disk</dt><dd id="diskStatus">-</dd></div>
+            <div><dt>Stats</dt><dd id="statsStatus">-</dd></div>
+          </dl>
+          <div id="eventList" class="events"></div>
+        </article>
+      </section>
+    </main>
+
+    <script>
+      window.__ajrmMarineLoggerAppStarted = false;
+      window.setTimeout(function () {
+        var banner = document.getElementById("statusBanner");
+        var status = document.getElementById("captureStatus");
+        if (!window.__ajrmMarineLoggerAppStarted && banner && banner.textContent === "Loading...") {
+          banner.textContent = "CapturePlus page script did not start. Hard refresh this page, then check that your browser allows JavaScript for this Signal K site.";
+          banner.className += " error";
+          if (status) {
+            status.textContent = "Status cannot update until the CapturePlus browser script loads.";
+          }
+        }
+      }, 3000);
+    </script>
+    <script src="/signalk-ajrm-marine-logger/app.js?v=1.2.3"></script>
+  </body>
+</html>

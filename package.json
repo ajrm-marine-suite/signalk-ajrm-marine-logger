@@ -1,0 +1,45 @@
+{
+  "name": "signalk-ajrm-marine-logger",
+  "version": "0.5.0",
+  "description": "Signal K logging and replay utility for AJRM Marine Suite testing.",
+  "main": "plugin/index.js",
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\" && node --check plugin/index.js && node --check public/app.js"
+  },
+  "keywords": [
+    "signalk-node-server-plugin",
+    "signalk-webapp",
+    "diagnostics",
+    "logger",
+    "replay",
+    "signal-k",
+    "signalk",
+    "ajrm-marine-suite",
+    "marine",
+    "navigation"
+  ],
+  "author": "Anthony McDonald, with assistance from William McAusland",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger/issues"
+  },
+  "homepage": "https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger#readme",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "plugin",
+    "public",
+    "README.md",
+    "LICENSE"
+  ],
+  "signalk-plugin-enabled-by-default": true,
+  "signalk": {
+    "displayName": "AJRM Marine Logger",
+    "appIcon": "./icon.svg"
+  }
+}
