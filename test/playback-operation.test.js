@@ -1,15 +1,20 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const { execFile: execFileCallback } = require("node:child_process");
 const EventEmitter = require("node:events");
 const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { promisify } = require("node:util");
+const zlib = require("node:zlib");
 const startPlugin = require("../plugin");
 const {
   createPlaybackOperation,
 } = require("../plugin/playback-operation");
+
+const execFile = promisify(execFileCallback);
 
 test("stopping invalidates an in-flight playback operation", () => {
   const operation = createPlaybackOperation();
@@ -51,6 +56,62 @@ test("voyage status ignores Voyage Viewer plot sidecars", async () => {
       status.voyages.map((voyage) => voyage.fileName),
       ["voyage-20260622T203128Z.zip"],
     );
+  } finally {
+    plugin.stop();
+  }
+});
+
+test("voyage playback loads local reference capture segments", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "capture-plus-reference-voyage-"));
+  const app = fakeApp();
+  const routes = new Map();
+  const plugin = startPlugin(app);
+  plugin.registerWithRouter(routerMap(routes));
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+  });
+
+  try {
+    const capturesDir = path.join(root, "captures");
+    const voyagesDir = path.join(root, "voyages");
+    const captureName = "capture-2026-06-26T18-59-15-290Z.jsonl";
+    const capturePath = path.join(capturesDir, `${captureName}.gz`);
+    const envelope = captureEnvelope("2026-06-26T18:59:15.290Z");
+    await fs.writeFile(capturePath, zlib.gzipSync(`${JSON.stringify(envelope)}\n`));
+
+    const staging = path.join(root, "voyage-stage");
+    await fs.mkdir(path.join(staging, "capture"), { recursive: true });
+    await fs.writeFile(
+      path.join(staging, "index.json"),
+      `${JSON.stringify({
+        id: "voyage-20260626T185915Z",
+        captureMode: "voyage",
+        captureFileMode: "reference",
+        captureFiles: [],
+        captureReferences: [
+          {
+            fileName: captureName,
+            sourcePath: path.join(capturesDir, captureName),
+            compressedSourcePath: capturePath,
+          },
+        ],
+      })}\n`,
+    );
+    await execFile("zip", ["-qr", path.join(voyagesDir, "voyage-20260626T185915Z.zip"), "."], {
+      cwd: staging,
+    });
+
+    const response = await invoke(routes, "POST", "/playback/load", {
+      file: "voyage-20260626T185915Z.zip",
+      kind: "voyages",
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.playback.loaded, true);
+    assert.equal(response.body.playback.totalLines, 1);
+    assert.equal(response.body.playback.voyageFileName, "voyage-20260626T185915Z.zip");
+    assert.equal(response.body.playback.fileName, `${captureName}.gz`);
   } finally {
     plugin.stop();
   }
@@ -130,6 +191,37 @@ function fakeApp() {
     debug() {},
     error() {},
   };
+}
+
+function routerMap(routes) {
+  return {
+    get(route, handler) {
+      routes.set(`GET ${route}`, handler);
+    },
+    post(route, handler) {
+      routes.set(`POST ${route}`, handler);
+    },
+  };
+}
+
+async function invoke(routes, method, route, body = {}) {
+  let statusCode = 200;
+  let payload;
+  const handler = routes.get(`${method} ${route}`);
+  assert.ok(handler, `expected route ${method} ${route}`);
+  await handler(
+    { body },
+    {
+      status(code) {
+        statusCode = code;
+        return this;
+      },
+      json(value) {
+        payload = value;
+      },
+    },
+  );
+  return { statusCode, body: payload };
 }
 
 function captureEnvelope(timestamp) {

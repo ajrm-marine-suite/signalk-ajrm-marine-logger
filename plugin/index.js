@@ -952,7 +952,11 @@ module.exports = function ajrmMarineLogger(app) {
 
     const captureDirectory = path.join(replayDirectory, "capture");
     const directory = (await directoryExists(captureDirectory)) ? captureDirectory : replayDirectory;
-    const segments = await listRecordingFiles(directory);
+    let segments = await listRecordingFiles(directory);
+    if (!segments.length) {
+      await linkReferencedVoyageSegments(sourcePath, fileName, directory);
+      segments = await listRecordingFiles(directory);
+    }
     if (!segments.length) {
       throw new Error(`Voyage ${fileName} does not contain any CapturePlus recording segments`);
     }
@@ -962,6 +966,60 @@ module.exports = function ajrmMarineLogger(app) {
       fullPath: path.join(directory, first.name),
       directory,
     };
+  }
+
+  async function linkReferencedVoyageSegments(sourcePath, voyageFileName, directory) {
+    const index = await readVoyageZipIndex(sourcePath);
+    const references = Array.isArray(index?.captureReferences)
+      ? index.captureReferences
+      : [];
+    if (!references.length) return 0;
+    await fs.promises.mkdir(directory, { recursive: true });
+    let linked = 0;
+    const missing = [];
+    for (const reference of references) {
+      const sourceFile = await resolveReferencedCaptureFile(reference);
+      if (!sourceFile) {
+        missing.push(reference?.fileName || reference?.compressedSourcePath || "unknown");
+        continue;
+      }
+      const linkName = path.basename(sourceFile);
+      const linkPath = path.join(directory, linkName);
+      await fs.promises.rm(linkPath, { force: true }).catch(() => {});
+      try {
+        await fs.promises.symlink(sourceFile, linkPath);
+      } catch (_error) {
+        await fs.promises.copyFile(sourceFile, linkPath);
+      }
+      linked += 1;
+    }
+    if (!linked && missing.length) {
+      throw new Error(
+        `Voyage ${voyageFileName} references local capture files that are not available: ${missing.join(", ")}`,
+      );
+    }
+    return linked;
+  }
+
+  async function resolveReferencedCaptureFile(reference = {}) {
+    const names = new Set();
+    for (const value of [
+      reference.compressedSourcePath,
+      reference.sourcePath,
+      reference.fileName,
+    ]) {
+      const name = path.basename(String(value || ""));
+      if (!name || name === "." || name === path.sep) continue;
+      names.add(name);
+      if (name.endsWith(".jsonl")) names.add(`${name}.gz`);
+    }
+    for (const name of names) {
+      if (!/\.jsonl(?:\.gz)?$/i.test(name)) continue;
+      const candidate = path.join(paths.captures, name);
+      const statsInfo = await fs.promises.stat(candidate).catch(() => null);
+      if (statsInfo?.isFile()) return candidate;
+    }
+    return null;
   }
 
   function startPlayback(rate) {
