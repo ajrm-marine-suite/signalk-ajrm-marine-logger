@@ -1174,13 +1174,17 @@ module.exports = function ajrmMarineLogger(app) {
 
     const currentMs = Date.parse(entry.capturedAt);
     const previousMs = playback.previousTs;
+    const previousWallMs = playback.lastLineWallMs;
     playback.previousTs = Number.isFinite(currentMs) ? currentMs : previousMs;
     playback.lastLineWallMs = Date.now();
     const sourceDelay =
       Number.isFinite(currentMs) && Number.isFinite(previousMs)
         ? Math.max(0, currentMs - previousMs)
         : 0;
-    scheduleNextPlaybackLine(sourceDelay / playback.rate, generation);
+    const elapsedWallMs = Number.isFinite(previousWallMs)
+      ? Math.max(0, playback.lastLineWallMs - previousWallMs)
+      : 0;
+    scheduleNextPlaybackLine(Math.max(0, sourceDelay / playback.rate - elapsedWallMs), generation);
   }
 
   async function autoAdvancePlaybackSegment() {

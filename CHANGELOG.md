@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.3
+
+- Compensate playback scheduling for per-delta processing time so high-speed replay catches up instead of drifting slower than the selected rate.
+
 ## 0.5.2
 
 - Expand compressed voyage replay segments into Logger's replay cache before loading, so playback can use line offsets instead of repeatedly rescanning gzip files.
