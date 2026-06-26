@@ -15,6 +15,7 @@ const {
 } = require("../plugin/playback-operation");
 
 const execFile = promisify(execFileCallback);
+const { calculatePlaybackDelayMs } = startPlugin._test;
 
 test("stopping invalidates an in-flight playback operation", () => {
   const operation = createPlaybackOperation();
@@ -32,6 +33,45 @@ test("a restarted playback receives a distinct current generation", () => {
   assert.notEqual(second, first);
   assert.equal(operation.isCurrent(first), false);
   assert.equal(operation.isCurrent(second), true);
+});
+
+test("numeric playback rate throttles against an anchored source clock", () => {
+  assert.equal(
+    calculatePlaybackDelayMs({
+      nextSourceMs: 120000,
+      sourceAnchorMs: 100000,
+      wallAnchorMs: 1000,
+      rate: 10,
+      nowMs: 2500,
+    }),
+    500,
+  );
+});
+
+test("numeric playback rate stops delaying once playback is behind schedule", () => {
+  assert.equal(
+    calculatePlaybackDelayMs({
+      nextSourceMs: 120000,
+      sourceAnchorMs: 100000,
+      wallAnchorMs: 1000,
+      rate: 20,
+      nowMs: 2500,
+    }),
+    0,
+  );
+});
+
+test("max playback never applies timing delay", () => {
+  assert.equal(
+    calculatePlaybackDelayMs({
+      nextSourceMs: 120000,
+      sourceAnchorMs: 100000,
+      wallAnchorMs: 1000,
+      rate: "max",
+      nowMs: 1000,
+    }),
+    0,
+  );
 });
 
 test("voyage status ignores Voyage Viewer plot sidecars", async () => {

@@ -1048,6 +1048,8 @@ module.exports = function ajrmMarineLogger(app) {
     playback.active = true;
     playback.paused = false;
     playback.lastReason = "playing";
+    playback.sourceAnchorMs = null;
+    playback.wallAnchorMs = null;
     playback.lastLineWallMs = null;
     const generation = playbackOperation.begin();
     scheduleNextPlaybackLine(0, generation);
@@ -1139,9 +1141,9 @@ module.exports = function ajrmMarineLogger(app) {
       scheduleNextPlaybackLine(0);
       return;
     }
-    const sourceDelay = Math.max(0, nextMs - currentMs);
-    const elapsedWallMs = Math.max(0, Date.now() - lastWallMs);
-    scheduleNextPlaybackLine(playbackDelayMs(sourceDelay, elapsedWallMs));
+    playback.sourceAnchorMs = currentMs;
+    playback.wallAnchorMs = Date.now();
+    scheduleNextPlaybackLine(playbackDelayToTimestamp(nextMs));
   }
 
   async function sendNextPlaybackLine(generation) {
@@ -1176,26 +1178,32 @@ module.exports = function ajrmMarineLogger(app) {
       stats.playbackSent += 1;
 
       const currentMs = Date.parse(entry.capturedAt);
-      const previousMs = playback.previousTs;
-      const previousWallMs = playback.lastLineWallMs;
-      playback.previousTs = Number.isFinite(currentMs) ? currentMs : previousMs;
       playback.lastLineWallMs = Date.now();
-      const sourceDelay =
-        Number.isFinite(currentMs) && Number.isFinite(previousMs)
-          ? Math.max(0, currentMs - previousMs)
-          : 0;
-      const elapsedWallMs = Number.isFinite(previousWallMs)
-        ? Math.max(0, playback.lastLineWallMs - previousWallMs)
-        : 0;
-      nextDelayMs = playbackDelayMs(sourceDelay, elapsedWallMs);
+      if (Number.isFinite(currentMs)) {
+        playback.previousTs = currentMs;
+        if (
+          !Number.isFinite(playback.sourceAnchorMs) ||
+          !Number.isFinite(playback.wallAnchorMs)
+        ) {
+          playback.sourceAnchorMs = currentMs;
+          playback.wallAnchorMs = playback.lastLineWallMs;
+        }
+      }
+      nextDelayMs = playbackDelayToTimestamp(playback.times?.[playback.cursor]);
       if (nextDelayMs > 0 || Date.now() - batchStartedMs >= 40) break;
     }
     scheduleNextPlaybackLine(nextDelayMs, generation);
   }
 
-  function playbackDelayMs(sourceDelay, elapsedWallMs = 0) {
+  function playbackDelayToTimestamp(nextSourceMs) {
     if (playback.rate === "max") return 0;
-    return Math.max(0, sourceDelay / Number(playback.rate || 1) - elapsedWallMs);
+    return calculatePlaybackDelayMs({
+      nextSourceMs,
+      sourceAnchorMs: playback.sourceAnchorMs,
+      wallAnchorMs: playback.wallAnchorMs,
+      rate: playback.rate,
+      nowMs: Date.now(),
+    });
   }
 
   async function autoAdvancePlaybackSegment() {
@@ -1218,6 +1226,8 @@ module.exports = function ajrmMarineLogger(app) {
     playback.active = true;
     playback.paused = false;
     playback.lastReason = "playing next segment";
+    playback.sourceAnchorMs = null;
+    playback.wallAnchorMs = null;
     playback.lastLineWallMs = null;
     const generation = playbackOperation.begin();
     stats.autoAdvanced += 1;
@@ -1790,6 +1800,8 @@ module.exports = function ajrmMarineLogger(app) {
       current: null,
       rate: 1,
       previousTs: null,
+      sourceAnchorMs: null,
+      wallAnchorMs: null,
       lastLineWallMs: null,
       timer: null,
       lastReason: "not loaded",
@@ -2048,6 +2060,29 @@ function normalizePlaybackRate(value, fallback = 1) {
   return clampNumber(value, fallback === "max" ? 1 : fallback, 0.1, 20);
 }
 
+function calculatePlaybackDelayMs({
+  nextSourceMs,
+  sourceAnchorMs,
+  wallAnchorMs,
+  rate,
+  nowMs,
+}) {
+  if (rate === "max") return 0;
+  const numericRate = Number(rate || 1);
+  if (
+    !Number.isFinite(nextSourceMs) ||
+    !Number.isFinite(sourceAnchorMs) ||
+    !Number.isFinite(wallAnchorMs) ||
+    !Number.isFinite(nowMs) ||
+    !Number.isFinite(numericRate) ||
+    numericRate <= 0
+  ) {
+    return 0;
+  }
+  const targetWallMs = wallAnchorMs + Math.max(0, nextSourceMs - sourceAnchorMs) / numericRate;
+  return Math.max(0, targetWallMs - nowMs);
+}
+
 function fileSize(filePath) {
   try {
     return fs.statSync(filePath).size;
@@ -2095,3 +2130,8 @@ async function readLineAtOffset(filePath, offset) {
     await handle.close();
   }
 }
+
+module.exports._test = {
+  calculatePlaybackDelayMs,
+  normalizePlaybackRate,
+};

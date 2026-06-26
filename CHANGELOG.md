@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.5
+
+- Anchor numeric playback speeds to the source recording clock so high-speed replay catches up when it falls behind instead of accumulating timer overhead.
+- Keep Max as the no-delay mode, while 10x and 20x remain throttled when the Pi has enough headroom.
+
 ## 0.5.4
 
 - Add a Max playback mode that uses no source-time delay and replays as fast as the Pi can process the deltas.
