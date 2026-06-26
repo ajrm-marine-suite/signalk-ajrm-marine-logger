@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.4
+
+- Add a Max playback mode that uses no source-time delay and replays as fast as the Pi can process the deltas.
+- Add the Max option to the web playback speed selector.
+
 ## 0.5.3
 
 - Compensate playback scheduling for per-delta processing time so high-speed replay catches up instead of drifting slower than the selected rate.

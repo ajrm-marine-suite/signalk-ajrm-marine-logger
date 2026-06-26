@@ -265,7 +265,7 @@ module.exports = function ajrmMarineLogger(app) {
 
     router.post(`${prefix}/playback/play`, write(async (req, res) => {
       try {
-        const rate = clampNumber(req.body?.rate, playback.rate || 1, 0.1, 20);
+        const rate = normalizePlaybackRate(req.body?.rate, playback.rate || 1);
         startPlayback(rate);
         res.json({ ok: true, playback: getPlaybackSummary() });
       } catch (error) {
@@ -275,7 +275,7 @@ module.exports = function ajrmMarineLogger(app) {
 
     router.post(`${prefix}/playback/rate`, write(async (req, res) => {
       try {
-        const rate = clampNumber(req.body?.rate, playback.rate || 1, 0.1, 20);
+        const rate = normalizePlaybackRate(req.body?.rate, playback.rate || 1);
         setPlaybackRate(rate);
         res.json({ ok: true, playback: getPlaybackSummary() });
       } catch (error) {
@@ -1141,50 +1141,61 @@ module.exports = function ajrmMarineLogger(app) {
     }
     const sourceDelay = Math.max(0, nextMs - currentMs);
     const elapsedWallMs = Math.max(0, Date.now() - lastWallMs);
-    scheduleNextPlaybackLine(Math.max(0, sourceDelay / playback.rate - elapsedWallMs));
+    scheduleNextPlaybackLine(playbackDelayMs(sourceDelay, elapsedWallMs));
   }
 
   async function sendNextPlaybackLine(generation) {
-    if (
-      !playbackOperation.isCurrent(generation) ||
-      !playback.active ||
-      playback.paused
-    ) {
-      return;
-    }
-    const entry = await readEnvelopeAtLine(playback.filePath, playback.cursor);
-    if (
-      !playbackOperation.isCurrent(generation) ||
-      !playback.active ||
-      playback.paused
-    ) {
-      return;
-    }
-    if (!entry) {
-      if (await autoAdvancePlaybackSegment()) return;
-      pausePlayback("end of capture");
-      return;
-    }
+    const batchStartedMs = Date.now();
+    let nextDelayMs = 0;
+    while (true) {
+      if (
+        !playbackOperation.isCurrent(generation) ||
+        !playback.active ||
+        playback.paused
+      ) {
+        return;
+      }
+      const entry = await readEnvelopeAtLine(playback.filePath, playback.cursor);
+      if (
+        !playbackOperation.isCurrent(generation) ||
+        !playback.active ||
+        playback.paused
+      ) {
+        return;
+      }
+      if (!entry) {
+        if (await autoAdvancePlaybackSegment()) return;
+        pausePlayback("end of capture");
+        return;
+      }
 
-    playback.cursor += 1;
-    playback.current = entry.capturedAt;
-    publishPlaybackClock(true);
-    app.handleMessage(plugin.id, replayDeltaWithCurrentTimestamps(entry.delta));
-    stats.playbackSent += 1;
+      playback.cursor += 1;
+      playback.current = entry.capturedAt;
+      publishPlaybackClock(true);
+      app.handleMessage(plugin.id, replayDeltaWithCurrentTimestamps(entry.delta));
+      stats.playbackSent += 1;
 
-    const currentMs = Date.parse(entry.capturedAt);
-    const previousMs = playback.previousTs;
-    const previousWallMs = playback.lastLineWallMs;
-    playback.previousTs = Number.isFinite(currentMs) ? currentMs : previousMs;
-    playback.lastLineWallMs = Date.now();
-    const sourceDelay =
-      Number.isFinite(currentMs) && Number.isFinite(previousMs)
-        ? Math.max(0, currentMs - previousMs)
+      const currentMs = Date.parse(entry.capturedAt);
+      const previousMs = playback.previousTs;
+      const previousWallMs = playback.lastLineWallMs;
+      playback.previousTs = Number.isFinite(currentMs) ? currentMs : previousMs;
+      playback.lastLineWallMs = Date.now();
+      const sourceDelay =
+        Number.isFinite(currentMs) && Number.isFinite(previousMs)
+          ? Math.max(0, currentMs - previousMs)
+          : 0;
+      const elapsedWallMs = Number.isFinite(previousWallMs)
+        ? Math.max(0, playback.lastLineWallMs - previousWallMs)
         : 0;
-    const elapsedWallMs = Number.isFinite(previousWallMs)
-      ? Math.max(0, playback.lastLineWallMs - previousWallMs)
-      : 0;
-    scheduleNextPlaybackLine(Math.max(0, sourceDelay / playback.rate - elapsedWallMs), generation);
+      nextDelayMs = playbackDelayMs(sourceDelay, elapsedWallMs);
+      if (nextDelayMs > 0 || Date.now() - batchStartedMs >= 40) break;
+    }
+    scheduleNextPlaybackLine(nextDelayMs, generation);
+  }
+
+  function playbackDelayMs(sourceDelay, elapsedWallMs = 0) {
+    if (playback.rate === "max") return 0;
+    return Math.max(0, sourceDelay / Number(playback.rate || 1) - elapsedWallMs);
   }
 
   async function autoAdvancePlaybackSegment() {
@@ -2028,6 +2039,13 @@ function clampNumber(value, fallback, min, max) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return Math.min(max, Math.max(min, number));
+}
+
+function normalizePlaybackRate(value, fallback = 1) {
+  const text = String(value ?? "").trim().toLowerCase();
+  if (text === "max" || text === "maximum") return "max";
+  if (fallback === "max" && (value === undefined || value === null || value === "")) return "max";
+  return clampNumber(value, fallback === "max" ? 1 : fallback, 0.1, 20);
 }
 
 function fileSize(filePath) {

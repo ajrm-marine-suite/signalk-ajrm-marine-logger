@@ -268,7 +268,7 @@ function renderPlayback() {
   elements.forwardButton.disabled = !playback.loaded;
   updateClipButtonState();
   if (document.activeElement !== elements.playbackRate) {
-    elements.playbackRate.value = playback.rate || 1;
+    elements.playbackRate.value = playback.rate === "max" ? "max" : playback.rate || 1;
   }
   elements.autoAdvancePlayback.checked = !state.options || state.options.autoAdvancePlayback !== false;
   populateClipRangeFromSource();
@@ -322,7 +322,7 @@ async function loadCapture(fileName, kind = activeFileTab) {
 async function play() {
   await runCommand("Play recording", () =>
     post("/playback/play", {
-      rate: Number(elements.playbackRate.value || 1),
+      rate: selectedPlaybackRate(),
     }),
   );
 }
@@ -332,9 +332,14 @@ async function updatePlaybackRate() {
   if (!playback.loaded) return;
   await runCommand("Set playback speed", () =>
     post("/playback/rate", {
-      rate: Number(elements.playbackRate.value || 1),
+      rate: selectedPlaybackRate(),
     }),
   );
+}
+
+function selectedPlaybackRate() {
+  const value = elements.playbackRate.value || "1";
+  return value === "max" ? "max" : Number(value);
 }
 
 async function updatePlaybackSettings() {

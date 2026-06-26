@@ -5,6 +5,9 @@
 AJRM Marine Logger is a Signal K diagnostic capture and replay plugin intended for
 AJRM Marine testing on a Signal K vessel server.
 
+Version `0.5.4` adds a **Max** playback mode that uses no source-time delay and
+replays as fast as the Pi can process the deltas.
+
 Version `0.5.3` compensates playback scheduling for per-delta processing time,
 so high-speed replay catches up instead of drifting slower than the selected
 rate.
@@ -62,7 +65,7 @@ The file browser has **Logs**, **Clips**, and **Voyages** tabs. Logs are full ca
 
 ```bash
 cd ~/.signalk
-npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.5.3 --omit=dev --no-package-lock
+npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.5.4 --omit=dev --no-package-lock
 sudo systemctl restart signalk
 ```
 
