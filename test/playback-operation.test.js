@@ -111,7 +111,8 @@ test("voyage playback loads local reference capture segments", async () => {
     assert.equal(response.body.playback.loaded, true);
     assert.equal(response.body.playback.totalLines, 1);
     assert.equal(response.body.playback.voyageFileName, "voyage-20260626T185915Z.zip");
-    assert.equal(response.body.playback.fileName, `${captureName}.gz`);
+    assert.equal(response.body.playback.fileName, captureName);
+    assert.equal(response.body.playback.compressed, false);
   } finally {
     plugin.stop();
   }

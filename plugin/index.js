@@ -955,8 +955,9 @@ module.exports = function ajrmMarineLogger(app) {
     let segments = await listRecordingFiles(directory);
     if (!segments.length) {
       await linkReferencedVoyageSegments(sourcePath, fileName, directory);
-      segments = await listRecordingFiles(directory);
     }
+    await materializeCompressedReplaySegments(directory);
+    segments = await listRecordingFiles(directory);
     if (!segments.length) {
       throw new Error(`Voyage ${fileName} does not contain any CapturePlus recording segments`);
     }
@@ -999,6 +1000,25 @@ module.exports = function ajrmMarineLogger(app) {
       );
     }
     return linked;
+  }
+
+  async function materializeCompressedReplaySegments(directory) {
+    const segments = await listRecordingFiles(directory);
+    for (const segment of segments) {
+      if (!segment.name.endsWith(".jsonl.gz")) continue;
+      const compressedPath = path.join(directory, segment.name);
+      const plainName = segment.name.replace(/\.gz$/i, "");
+      const plainPath = path.join(directory, plainName);
+      const existing = await fs.promises.stat(plainPath).catch(() => null);
+      if (existing?.isFile() && existing.size > 0) continue;
+      const temporaryPath = `${plainPath}.${process.pid}.${Date.now()}.tmp`;
+      await pipeline(
+        fs.createReadStream(compressedPath),
+        zlib.createGunzip(),
+        fs.createWriteStream(temporaryPath),
+      );
+      await fs.promises.rename(temporaryPath, plainPath);
+    }
   }
 
   async function resolveReferencedCaptureFile(reference = {}) {
