@@ -35,10 +35,6 @@ intent closes the active capture.
 Version `1.2.6` listens for AJRM Marine Pi Controller shutdown/reboot intent and closes the
 active capture and rolling buffer before the power command runs.
 
-Version `1.2.1` updates the user-facing name to **AJRM Marine Logger** while
-keeping the package id, route names, API paths, and existing `~/CapturePlusLogs`
-directory stable for compatibility.
-
 Version `1.2.0` adds voyage-bundle playback and per-file downloads. Voyage
 zip files created by AJRM Marine Capture can be placed in `voyages/`, loaded
 from the AJRM Marine Logger **Voyages** tab, and replayed through the contained
@@ -51,8 +47,12 @@ It keeps a rolling buffer of recent Signal K deltas on disk. When you press **St
 By default, AJRM Marine Logger writes to:
 
 ```text
-~/CapturePlusLogs
+~/AJRMMarineLogs
 ```
+
+If a Pi already has recordings in the former logger directory and no explicit
+log-directory setting, AJRM Marine Logger continues to use that existing
+directory so upgrades do not hide earlier voyages.
 
 The plugin creates:
 
@@ -63,7 +63,7 @@ The plugin creates:
 
 Active capture files are written as plain `.jsonl` so they remain robust while data is arriving. Completed capture files are gzip-compressed to `.jsonl.gz` by default. AJRM Marine Logger can list, replay, seek within, and extract clips from both plain and gzipped recordings without creating an uncompressed copy on disk.
 
-Long captures are split into hourly files by default. The plugin starts a new plain file immediately, then compresses the previous completed segment in the background. When a capture or clip is closed, CapturePlus writes a small `.meta.json` sidecar beside the log with the line count and first/last timestamps, so the Logs and Clips tabs can show time ranges immediately after a restart. Older logs without sidecar metadata are indexed in the background the first time the status page sees them.
+Long captures are split into hourly files by default. The plugin starts a new plain file immediately, then compresses the previous completed segment in the background. When a capture or clip is closed, AJRM Marine Logger writes a small `.meta.json` sidecar beside the log with the line count and first/last timestamps, so the Logs and Clips tabs can show time ranges immediately after a restart. Older logs without sidecar metadata are indexed in the background the first time the status page sees them.
 
 On startup, AJRM Marine Logger recovers from abrupt shutdowns before starting a new capture. It removes empty stale `.jsonl` capture files that were opened but never received data, removes incomplete `.jsonl.gz.tmp` compression files, removes incomplete metadata temp files, and compresses leftover non-empty plain capture files from an earlier shutdown or crash. The web page has an **Auto-start capture** checkbox for starting a new capture automatically when the plugin starts, useful when you want to record everything each day. Auto-start begins at the current time without pre-capture backfill so restarted unattended captures do not duplicate the previous segment; manual **Start Capture** still uses the configured pre-capture minutes. Web-page playback/capture toggles are saved in `settings.json` under the log directory. Playback can automatically continue into the next chronological recording segment in the same list, so an hourly capture can be replayed like a playlist. The web page has an **Auto-play next file** checkbox for this. Clip extraction can span these segment boundaries when the requested end time is in a later file.
 
@@ -91,8 +91,8 @@ The app talks to AJRM Marine Logger through the compatibility path `/signalk/v1/
 
 - status and file listings need normal read access
 - capture, playback, settings, clip extraction, and delete commands need `readwrite` or `admin`
-- if a control command only has read access, CapturePlus submits a `readwrite` device request; approve it in **Access Requests** and Signal K will add the browser to **Devices**
-- the approved token is stored in that browser, so future CapturePlus commands do not need an admin session unless the token expires or is removed
+- if a control command only has read access, AJRM Marine Logger submits a `readwrite` device request; approve it in **Access Requests** and Signal K will add the browser to **Devices**
+- the approved token is stored in that browser, so future AJRM Marine Logger commands do not need an admin session unless the token expires or is removed
 
 The legacy `/plugins/signalk-ajrm-marine-logger/...` route still exists for compatibility, but Signal K admin-gates `/plugins/*`. Device approval alone does not unlock that legacy admin route.
 

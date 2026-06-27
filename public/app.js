@@ -63,11 +63,11 @@ let accessToken = readStoredValue(ACCESS_TOKEN_STORAGE_KEY);
 let accessRequestTimer = null;
 
 window.addEventListener("error", (event) => {
-  setStartupError(event.message || "CapturePlus browser script failed");
+  setStartupError(event.message || "AJRM Marine Logger browser script failed");
 });
 window.addEventListener("unhandledrejection", (event) => {
   const reason = event.reason || {};
-  setStartupError(reason.message || String(reason) || "CapturePlus request failed");
+  setStartupError(reason.message || String(reason) || "AJRM Marine Logger request failed");
 });
 
 elements.refreshButton.addEventListener("click", refresh);
@@ -166,7 +166,7 @@ function renderCaptureStatus() {
 }
 
 function renderOffline(error) {
-  elements.captureStatus.textContent = `CapturePlus status unavailable: ${error.message}`;
+  elements.captureStatus.textContent = `AJRM Marine Logger status unavailable: ${error.message}`;
   elements.startCaptureButton.disabled = true;
   elements.stopCaptureButton.disabled = true;
   elements.captureList.innerHTML = error.loginUrl
@@ -550,16 +550,16 @@ async function readLoginStatus() {
 function ajrmMarineLoggerAccessMessage(status, body, text, loginStatus) {
   if (body && body.error) return body.error;
   if (loginStatus && loginStatus.authenticationRequired === false) {
-    return `Signal K refused CapturePlus access: ${friendlyHttpError(status, text)}`;
+    return `Signal K refused AJRM Marine Logger access: ${friendlyHttpError(status, text)}`;
   }
   if (status === 403) {
-    return "CapturePlus controls require Signal K read/write or admin access.";
+    return "AJRM Marine Logger controls require Signal K read/write or admin access.";
   }
   if (!loginStatus || loginStatus.status !== "loggedIn") {
-    return "CapturePlus needs a Signal K login or approved device token.";
+    return "AJRM Marine Logger needs a Signal K login or approved device token.";
   }
   const userLevel = (loginStatus && loginStatus.userLevel) || "non-admin";
-  return `CapturePlus controls require Signal K read/write or admin access. Current user level: ${userLevel}.`;
+  return `AJRM Marine Logger controls require Signal K read/write or admin access. Current user level: ${userLevel}.`;
 }
 
 function parseJson(text) {
@@ -572,7 +572,7 @@ function parseJson(text) {
 
 function friendlyHttpError(status, text) {
   if (status === 401 || status === 403) {
-    return "Signal K login required or this user is not allowed to control CapturePlus.";
+    return "Signal K login required or this user is not allowed to control AJRM Marine Logger.";
   }
   const cleaned = String(text || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
   return cleaned || `HTTP ${status}`;
@@ -634,7 +634,7 @@ async function requestSignalKAccess(label) {
   if (pendingHref) {
     pollAccessRequest(pendingHref);
     setBanner(
-      `${label} needs write access. Approve the pending CapturePlus request in Signal K Access Requests.`,
+      `${label} needs write access. Approve the pending AJRM Marine Logger request in Signal K Access Requests.`,
       true,
     );
     return true;
@@ -646,7 +646,7 @@ async function requestSignalKAccess(label) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         clientId: getClientId(),
-        description: "CapturePlus browser",
+        description: "AJRM Marine Logger browser",
         permissions: "readwrite",
       }),
     });
@@ -658,7 +658,7 @@ async function requestSignalKAccess(label) {
       );
       if (duplicate) {
         setBanner(
-          `${label} needs write access. A CapturePlus access request is already pending in Signal K.`,
+          `${label} needs write access. A AJRM Marine Logger access request is already pending in Signal K.`,
           true,
         );
         return true;
@@ -670,7 +670,7 @@ async function requestSignalKAccess(label) {
       pollAccessRequest(body.href);
     }
     setBanner(
-      `${label} needs write access. Approve CapturePlus in Signal K Access Requests, then try again.`,
+      `${label} needs write access. Approve AJRM Marine Logger in Signal K Access Requests, then try again.`,
       true,
     );
     return true;
@@ -703,11 +703,11 @@ function pollAccessRequest(href) {
       if (token) {
         accessToken = token;
         writeStoredValue(ACCESS_TOKEN_STORAGE_KEY, token);
-        setBanner("CapturePlus write access approved.");
+        setBanner("AJRM Marine Logger write access approved.");
         await refresh();
         return;
       }
-      setBanner("CapturePlus write access was not approved.", true);
+      setBanner("AJRM Marine Logger write access was not approved.", true);
     } catch (_error) {
       pollAccessRequest(href);
     }
@@ -720,7 +720,7 @@ function getClientId() {
   const generated = window.crypto && window.crypto.randomUUID
     ? window.crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const clientId = `capture-plus-${generated}`;
+  const clientId = `ajrm-marine-logger-${generated}`;
   writeStoredValue(CLIENT_ID_STORAGE_KEY, clientId);
   return clientId;
 }
@@ -797,9 +797,9 @@ function setBanner(message, isError = false, linkUrl = "", linkText = "") {
 
 function setStartupError(message) {
   if (!elements || !elements.banner) return;
-  setBanner(`CapturePlus cannot update the page: ${message}`, true);
+  setBanner(`AJRM Marine Logger cannot update the page: ${message}`, true);
   if (elements.captureStatus) {
-    elements.captureStatus.textContent = "CapturePlus browser script failed. Try a hard refresh, then check Signal K login/access.";
+    elements.captureStatus.textContent = "AJRM Marine Logger browser script failed. Try a hard refresh, then check Signal K login/access.";
   }
 }
 

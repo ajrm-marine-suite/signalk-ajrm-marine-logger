@@ -11,6 +11,8 @@ const { createPlaybackOperation } = require("./playback-operation");
 
 const PLAYBACK_CLOCK_PATH = "plugins.ajrmMarineLogger.playback";
 const POWER_INTENT_PATH = "plugins.ajrmMarinePiController.power.intent";
+const DEFAULT_LOG_DIRECTORY = "~/AJRMMarineLogs";
+const LEGACY_LOG_DIRECTORY = ["~/Capture", "PlusLogs"].join("");
 const RECORDING_METADATA_VERSION = 1;
 const AJRM_MARINE_LOGGER_API_REGISTRY = Symbol.for("mcdonaldajr.ajrmMarineLoggerApi");
 const execFile = util.promisify(childProcess.execFile);
@@ -54,7 +56,7 @@ module.exports = function ajrmMarineLogger(app) {
       logDirectory: {
         type: "string",
         title: "Log directory",
-        default: "~/CapturePlusLogs",
+        default: DEFAULT_LOG_DIRECTORY,
       },
       bufferMinutes: {
         type: "integer",
@@ -437,7 +439,7 @@ module.exports = function ajrmMarineLogger(app) {
       res.status(403).json({
         ok: false,
         error:
-          "CapturePlus control requires Signal K read/write or admin access. Approve this device in Access Requests/Devices, or log in as an admin.",
+          "AJRM Marine Logger control requires Signal K read/write or admin access. Approve this device in Access Requests/Devices, or log in as an admin.",
       });
       return undefined;
     };
@@ -445,7 +447,7 @@ module.exports = function ajrmMarineLogger(app) {
 
   function normalizeOptions(value) {
     return {
-      logDirectory: expandHome(String(value.logDirectory || "~/CapturePlusLogs")),
+      logDirectory: expandHome(String(value.logDirectory || defaultLogDirectory())),
       bufferMinutes: clampInt(value.bufferMinutes, 30, 1, 1440),
       segmentSeconds: clampInt(value.segmentSeconds, 60, 10, 3600),
       maxBackfillMinutes: clampInt(value.maxBackfillMinutes, 120, 1, 1440),
@@ -1060,7 +1062,7 @@ module.exports = function ajrmMarineLogger(app) {
     await materializeCompressedReplaySegments(directory);
     segments = await listRecordingFiles(directory);
     if (!segments.length) {
-      throw new Error(`Voyage ${fileName} does not contain any CapturePlus recording segments`);
+      throw new Error(`Voyage ${fileName} does not contain any AJRM Marine Logger recording segments`);
     }
     const entries = [];
     for (const segment of segments) {
@@ -2070,8 +2072,14 @@ module.exports = function ajrmMarineLogger(app) {
     const recordingText = recording ? `recording ${recording.fileName}` : "buffering";
     const playbackText = playback.active ? `, playing ${playback.fileName}` : "";
     app.setPluginStatus(
-      `CapturePlus v${packageInfo.version}: ${recordingText}${playbackText}`,
+      `AJRM Marine Logger v${packageInfo.version}: ${recordingText}${playbackText}`,
     );
+  }
+
+  function defaultLogDirectory() {
+    const preferred = expandHome(DEFAULT_LOG_DIRECTORY);
+    const legacy = expandHome(LEGACY_LOG_DIRECTORY);
+    return !fs.existsSync(preferred) && fs.existsSync(legacy) ? LEGACY_LOG_DIRECTORY : DEFAULT_LOG_DIRECTORY;
   }
 
   function addEvent(event, message) {

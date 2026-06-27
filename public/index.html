@@ -179,10 +179,10 @@
         var banner = document.getElementById("statusBanner");
         var status = document.getElementById("captureStatus");
         if (!window.__ajrmMarineLoggerAppStarted && banner && banner.textContent === "Loading...") {
-          banner.textContent = "CapturePlus page script did not start. Hard refresh this page, then check that your browser allows JavaScript for this Signal K site.";
+          banner.textContent = "AJRM Marine Logger page script did not start. Hard refresh this page, then check that your browser allows JavaScript for this Signal K site.";
           banner.className += " error";
           if (status) {
-            status.textContent = "Status cannot update until the CapturePlus browser script loads.";
+            status.textContent = "Status cannot update until the AJRM Marine Logger browser script loads.";
           }
         }
       }, 3000);

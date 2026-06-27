@@ -224,7 +224,7 @@ test("playback input path classification keeps raw paths and rejects derived pat
 });
 
 test("voyage status ignores Voyage Viewer plot sidecars", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "capture-plus-voyages-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-voyages-"));
   const app = fakeApp();
   const plugin = startPlugin(app);
   plugin.start({
@@ -251,7 +251,7 @@ test("voyage status ignores Voyage Viewer plot sidecars", async () => {
 });
 
 test("voyage playback loads local reference capture segments", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "capture-plus-reference-voyage-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-reference-voyage-"));
   const app = fakeApp();
   const routes = new Map();
   const plugin = startPlugin(app);
@@ -308,7 +308,7 @@ test("voyage playback loads local reference capture segments", async () => {
 });
 
 test("voyage playback starts at configured warm-up when long backfill exists", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "capture-plus-warmup-voyage-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-warmup-voyage-"));
   const app = fakeApp();
   const routes = new Map();
   const plugin = startPlugin(app);
@@ -376,7 +376,7 @@ test("voyage playback starts at configured warm-up when long backfill exists", a
 });
 
 test("voyage playback can include full backfill for debugging", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "capture-plus-full-backfill-voyage-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-full-backfill-voyage-"));
   const app = fakeApp();
   const routes = new Map();
   const plugin = startPlugin(app);
@@ -439,7 +439,7 @@ test("voyage playback can include full backfill for debugging", async () => {
 });
 
 test("capture backfill ignores buffer files from before plugin start", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "capture-plus-old-buffer-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-old-buffer-"));
   const bufferDir = path.join(root, "buffer");
   await fs.mkdir(bufferDir, { recursive: true });
   await fs.writeFile(
@@ -464,7 +464,7 @@ test("capture backfill ignores buffer files from before plugin start", async () 
 });
 
 test("capture backfill keeps current plugin run buffer entries", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "capture-plus-current-buffer-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-current-buffer-"));
   const app = fakeApp();
   const plugin = startPlugin(app);
   plugin.start({
@@ -484,7 +484,7 @@ test("capture backfill keeps current plugin run buffer entries", async () => {
 });
 
 test("AJRM Marine Pi Controller power intent closes active capture", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "capture-plus-power-intent-"));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-power-intent-"));
   const app = fakeApp();
   const plugin = startPlugin(app);
   plugin.start({
