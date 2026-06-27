@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.8
+
+- Add a configurable voyage replay warm-up window, defaulting to seven minutes, so normal replay primes AIS/static data without replaying the whole debug backfill.
+- Add a full-backfill replay option for debugging voyages from the earliest bundled capture record.
+- Publish voyage start and warm-up status on the Logger playback clock for downstream apps.
+
 ## 0.5.7
 
 - Materialise compressed `.jsonl.gz` captures into Logger's replay cache before

@@ -307,6 +307,137 @@ test("voyage playback loads local reference capture segments", async () => {
   }
 });
 
+test("voyage playback starts at configured warm-up when long backfill exists", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "capture-plus-warmup-voyage-"));
+  const app = fakeApp();
+  const routes = new Map();
+  const plugin = startPlugin(app);
+  plugin.registerWithRouter(routerMap(routes));
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+    replayWarmupMinutes: 1,
+  });
+
+  try {
+    const capturesDir = path.join(root, "captures");
+    const voyagesDir = path.join(root, "voyages");
+    const captureName = "capture-2026-06-26T18-35-00-000Z.jsonl";
+    const capturePath = path.join(capturesDir, `${captureName}.gz`);
+    const envelopes = [
+      captureEnvelope("2026-06-26T18:35:00.000Z"),
+      captureEnvelope("2026-06-26T18:40:00.000Z"),
+      captureEnvelope("2026-06-26T18:43:49.000Z"),
+      captureEnvelope("2026-06-26T18:44:10.000Z"),
+    ];
+    await fs.writeFile(
+      capturePath,
+      zlib.gzipSync(`${envelopes.map((entry) => JSON.stringify(entry)).join("\n")}\n`),
+    );
+
+    const staging = path.join(root, "voyage-stage");
+    await fs.mkdir(path.join(staging, "capture"), { recursive: true });
+    await fs.writeFile(
+      path.join(staging, "index.json"),
+      `${JSON.stringify({
+        id: "voyage-20260626T184348Z",
+        startedAt: "2026-06-26T18:43:48.000Z",
+        stoppedAt: "2026-06-26T18:45:00.000Z",
+        captureMode: "voyage",
+        captureFileMode: "reference",
+        captureReferences: [
+          {
+            fileName: captureName,
+            compressedSourcePath: capturePath,
+          },
+        ],
+      })}\n`,
+    );
+    await execFile("zip", ["-qr", path.join(voyagesDir, "voyage-20260626T184348Z.zip"), "."], {
+      cwd: staging,
+    });
+
+    const response = await invoke(routes, "POST", "/playback/load", {
+      file: "voyage-20260626T184348Z.zip",
+      kind: "voyages",
+    });
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.playback.cursor, 2);
+    assert.equal(response.body.playback.from, "2026-06-26T18:43:49.000Z");
+    assert.equal(response.body.playback.captureFrom, "2026-06-26T18:35:00.000Z");
+    assert.equal(response.body.playback.warmupStartedAt, "2026-06-26T18:42:48.000Z");
+    assert.equal(response.body.playback.voyageStartedAt, "2026-06-26T18:43:48.000Z");
+    assert.equal(response.body.playback.includeFullBackfill, false);
+  } finally {
+    plugin.stop();
+  }
+});
+
+test("voyage playback can include full backfill for debugging", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "capture-plus-full-backfill-voyage-"));
+  const app = fakeApp();
+  const routes = new Map();
+  const plugin = startPlugin(app);
+  plugin.registerWithRouter(routerMap(routes));
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+    replayWarmupMinutes: 1,
+  });
+
+  try {
+    const capturesDir = path.join(root, "captures");
+    const voyagesDir = path.join(root, "voyages");
+    const captureName = "capture-2026-06-26T18-35-00-000Z.jsonl";
+    const capturePath = path.join(capturesDir, `${captureName}.gz`);
+    await fs.writeFile(
+      capturePath,
+      zlib.gzipSync(`${[
+        captureEnvelope("2026-06-26T18:35:00.000Z"),
+        captureEnvelope("2026-06-26T18:43:49.000Z"),
+      ].map((entry) => JSON.stringify(entry)).join("\n")}\n`),
+    );
+
+    const staging = path.join(root, "voyage-stage");
+    await fs.mkdir(path.join(staging, "capture"), { recursive: true });
+    await fs.writeFile(
+      path.join(staging, "index.json"),
+      `${JSON.stringify({
+        id: "voyage-20260626T184348Z",
+        startedAt: "2026-06-26T18:43:48.000Z",
+        captureFileMode: "reference",
+        captureReferences: [
+          {
+            fileName: captureName,
+            compressedSourcePath: capturePath,
+          },
+        ],
+      })}\n`,
+    );
+    await execFile("zip", ["-qr", path.join(voyagesDir, "voyage-20260626T184348Z.zip"), "."], {
+      cwd: staging,
+    });
+
+    const response = await invoke(routes, "POST", "/playback/load", {
+      file: "voyage-20260626T184348Z.zip",
+      kind: "voyages",
+      includeFullBackfill: true,
+    });
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.playback.cursor, 0);
+    assert.equal(response.body.playback.from, "2026-06-26T18:35:00.000Z");
+    assert.equal(response.body.playback.captureFrom, "2026-06-26T18:35:00.000Z");
+    assert.equal(response.body.playback.warmupStartedAt, null);
+    assert.equal(response.body.playback.includeFullBackfill, true);
+  } finally {
+    plugin.stop();
+  }
+});
+
 test("capture backfill ignores buffer files from before plugin start", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "capture-plus-old-buffer-"));
   const bufferDir = path.join(root, "buffer");

@@ -18,6 +18,8 @@ const elements = {
   backfillMinutes: document.getElementById("backfillMinutes"),
   captureSegmentMinutes: document.getElementById("captureSegmentMinutes"),
   autoStartCapture: document.getElementById("autoStartCapture"),
+  replayWarmupMinutes: document.getElementById("replayWarmupMinutes"),
+  replayFullBackfill: document.getElementById("replayFullBackfill"),
   startCaptureButton: document.getElementById("startCaptureButton"),
   stopCaptureButton: document.getElementById("stopCaptureButton"),
   logsTab: document.getElementById("logsTab"),
@@ -75,6 +77,8 @@ elements.stopCaptureButton.addEventListener("click", stopCapture);
 elements.backfillMinutes.addEventListener("change", updateCaptureSettings);
 elements.captureSegmentMinutes.addEventListener("change", updateCaptureSettings);
 elements.autoStartCapture.addEventListener("change", updateCaptureSettings);
+elements.replayWarmupMinutes.addEventListener("change", updatePlaybackSettings);
+elements.replayFullBackfill.addEventListener("change", updatePlaybackSettings);
 elements.logsTab.addEventListener("click", () => setFileTab("logs"));
 elements.clipsTab.addEventListener("click", () => setFileTab("clips"));
 elements.voyagesTab.addEventListener("click", () => setFileTab("voyages"));
@@ -147,12 +151,18 @@ function renderCaptureStatus() {
   if (document.activeElement !== elements.captureSegmentMinutes) {
     elements.captureSegmentMinutes.value = (state.options && state.options.captureSegmentMinutes) || 60;
   }
+  if (document.activeElement !== elements.replayWarmupMinutes) {
+    elements.replayWarmupMinutes.value = state.options && state.options.replayWarmupMinutes != null
+      ? state.options.replayWarmupMinutes
+      : 7;
+  }
   elements.captureStatus.textContent = recording
     ? `Recording ${recording.fileName} with ${recording.lines} deltas`
     : `Buffering ${(state.options && state.options.bufferMinutes) || 30} minutes in ${(state.paths && state.paths.root) || ""}`;
   elements.startCaptureButton.disabled = Boolean(recording || (state.playback && state.playback.active));
   elements.stopCaptureButton.disabled = !recording;
   elements.autoStartCapture.checked = state.options && state.options.autoStartCapture === true;
+  elements.replayFullBackfill.checked = state.options && state.options.replayFullBackfill === true;
 }
 
 function renderOffline(error) {
@@ -258,8 +268,9 @@ function renderPlayback() {
   elements.playbackTime.textContent = playback.current
     ? new Date(playback.current).toLocaleString()
     : "-";
+  const warmupText = playback.warmupActive ? " · warm-up" : "";
   elements.playbackProgress.textContent = playback.loaded
-    ? `${playback.cursor || 0} / ${playback.totalLines || 0} deltas (${playback.lastReason || "ready"})`
+    ? `${playback.cursor || 0} / ${playback.totalLines || 0} deltas (${playback.lastReason || "ready"}${warmupText})`
     : "No recording loaded";
   elements.playButton.disabled = !playback.loaded || playback.active || Boolean(state.recording);
   elements.pauseButton.disabled = !playback.active;
@@ -308,6 +319,8 @@ async function updateCaptureSettings() {
       backfillMinutes: Number(elements.backfillMinutes.value || 0),
       captureSegmentMinutes: Number(elements.captureSegmentMinutes.value || 60),
       autoStartCapture: elements.autoStartCapture.checked,
+      replayWarmupMinutes: Number(elements.replayWarmupMinutes.value || 7),
+      replayFullBackfill: elements.replayFullBackfill.checked,
     }),
   );
 }
@@ -316,7 +329,11 @@ async function loadCapture(fileName, kind = activeFileTab) {
   selectedFile = fileName;
   selectedKind = kind;
   if (kind === "logs") lastSelectedLogFile = fileName;
-  await runCommand("Load recording", () => post("/playback/load", { file: fileName, kind }));
+  await runCommand("Load recording", () => post("/playback/load", {
+    file: fileName,
+    kind,
+    includeFullBackfill: kind === "voyages" && elements.replayFullBackfill.checked,
+  }));
 }
 
 async function play() {
@@ -349,6 +366,8 @@ async function updatePlaybackSettings() {
       autoAdvancePlayback: elements.autoAdvancePlayback.checked,
       backfillMinutes: Number(elements.backfillMinutes.value || 0),
       captureSegmentMinutes: Number(elements.captureSegmentMinutes.value || 60),
+      replayWarmupMinutes: Number(elements.replayWarmupMinutes.value || 7),
+      replayFullBackfill: elements.replayFullBackfill.checked,
     }),
   );
 }

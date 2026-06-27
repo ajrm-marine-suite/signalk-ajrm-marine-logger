@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AJRM Marine Logger</title>
-    <link rel="stylesheet" href="/signalk-ajrm-marine-logger/styles.css?v=1.2.2" />
+    <link rel="stylesheet" href="/signalk-ajrm-marine-logger/styles.css?v=0.5.8" />
   </head>
   <body>
     <main>
@@ -61,6 +61,28 @@
           <label class="check-field">
             <input id="autoAdvancePlayback" type="checkbox" />
             <span>Auto-play next file</span>
+          </label>
+          <label
+            class="inline-field"
+            title="When a voyage is loaded, start replay this many minutes before voyage start if those records exist. This primes AIS/static data without replaying the full debug backfill."
+          >
+            Replay warm-up
+            <input
+              id="replayWarmupMinutes"
+              type="number"
+              min="0"
+              max="1440"
+              value="7"
+              title="When a voyage is loaded, start replay this many minutes before voyage start if those records exist. This primes AIS/static data without replaying the full debug backfill."
+            />
+            <span>min</span>
+          </label>
+          <label
+            class="check-field"
+            title="Debug mode: start voyage replay from the earliest bundled capture record instead of the warm-up point."
+          >
+            <input id="replayFullBackfill" type="checkbox" />
+            <span>Replay full backfill</span>
           </label>
         </div>
       </section>
@@ -165,6 +187,6 @@
         }
       }, 3000);
     </script>
-    <script src="/signalk-ajrm-marine-logger/app.js?v=1.2.3"></script>
+    <script src="/signalk-ajrm-marine-logger/app.js?v=0.5.8"></script>
   </body>
 </html>

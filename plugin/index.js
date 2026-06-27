@@ -99,6 +99,22 @@ module.exports = function ajrmMarineLogger(app) {
         title: "Automatically start capture when plugin starts",
         default: false,
       },
+      replayWarmupMinutes: {
+        type: "integer",
+        title: "Voyage replay warm-up in minutes",
+        description:
+          "When loading a voyage, start replay this many minutes before the voyage start if that data exists. This lets AIS/static data settle without replaying the full debug backfill.",
+        default: 7,
+        minimum: 0,
+        maximum: 1440,
+      },
+      replayFullBackfill: {
+        type: "boolean",
+        title: "Replay full voyage backfill",
+        description:
+          "Debug option. When enabled, voyage replay starts at the earliest bundled capture record instead of the warm-up point.",
+        default: false,
+      },
       includePaths: {
         type: "array",
         title: "Signal K paths to record",
@@ -256,7 +272,9 @@ module.exports = function ajrmMarineLogger(app) {
           return;
         }
         const fileName = safeBaseName(req.body?.file);
-        const result = await loadPlayback(fileName, req.body?.kind);
+        const result = await loadPlayback(fileName, req.body?.kind, {
+          includeFullBackfill: req.body?.includeFullBackfill === true,
+        });
         res.json({ ok: true, playback: result });
       } catch (error) {
         res.status(400).json({ ok: false, error: error.message });
@@ -336,6 +354,22 @@ module.exports = function ajrmMarineLogger(app) {
             1440,
           );
           addEvent("settings", `Log cycle set to ${options.captureSegmentMinutes} minutes`);
+        }
+        if (req.body?.replayWarmupMinutes !== undefined) {
+          options.replayWarmupMinutes = clampInt(
+            req.body.replayWarmupMinutes,
+            options.replayWarmupMinutes,
+            0,
+            1440,
+          );
+          addEvent("settings", `Voyage replay warm-up set to ${options.replayWarmupMinutes} minutes`);
+        }
+        if (typeof req.body?.replayFullBackfill === "boolean") {
+          options.replayFullBackfill = req.body.replayFullBackfill;
+          addEvent(
+            "settings",
+            `Voyage full-backfill replay ${options.replayFullBackfill ? "enabled" : "disabled"}`,
+          );
         }
         saveRuntimeSettings();
         res.json({ ok: true, options, playback: getPlaybackSummary() });
@@ -420,6 +454,8 @@ module.exports = function ajrmMarineLogger(app) {
       compressCompletedCaptures: value.compressCompletedCaptures !== false,
       autoAdvancePlayback: value.autoAdvancePlayback !== false,
       autoStartCapture: value.autoStartCapture === true,
+      replayWarmupMinutes: clampInt(value.replayWarmupMinutes, 7, 0, 1440),
+      replayFullBackfill: value.replayFullBackfill === true,
       includePaths: normalizeIncludePaths(value.includePaths),
       statusRefreshSeconds: clampInt(value.statusRefreshSeconds, 2, 1, 60),
     };
@@ -464,6 +500,8 @@ module.exports = function ajrmMarineLogger(app) {
         autoStartCapture: parsed.autoStartCapture === true,
         backfillMinutes: clampInt(parsed.backfillMinutes, 30, 0, 1440),
         captureSegmentMinutes: clampInt(parsed.captureSegmentMinutes, 60, 1, 1440),
+        replayWarmupMinutes: clampInt(parsed.replayWarmupMinutes, 7, 0, 1440),
+        replayFullBackfill: parsed.replayFullBackfill === true,
       };
     } catch {
       return {};
@@ -478,6 +516,8 @@ module.exports = function ajrmMarineLogger(app) {
         autoStartCapture: options.autoStartCapture,
         backfillMinutes: options.backfillMinutes,
         captureSegmentMinutes: options.captureSegmentMinutes,
+        replayWarmupMinutes: options.replayWarmupMinutes,
+        replayFullBackfill: options.replayFullBackfill,
       }, null, 2)}\n`,
     );
   }
@@ -870,11 +910,14 @@ module.exports = function ajrmMarineLogger(app) {
     }
   }
 
-  async function loadPlayback(fileName, kind) {
+  async function loadPlayback(fileName, kind, playbackOptions = {}) {
     stopPlayback("loading");
     const normalizedKind = kind ? normalizeRecordingKind(kind) : null;
     if (normalizedKind === "voyages") {
-      const firstSegment = await prepareVoyagePlayback(fileName);
+      const firstSegment = await prepareVoyagePlayback(fileName, {
+        includeFullBackfill:
+          playbackOptions.includeFullBackfill === true || options.replayFullBackfill === true,
+      });
       return loadPlaybackFile({
         fileName: firstSegment.name,
         filePath: firstSegment.fullPath,
@@ -882,6 +925,10 @@ module.exports = function ajrmMarineLogger(app) {
         sourceKind: "voyages",
         voyageFileName: fileName,
         displayFileName: `${fileName} / ${firstSegment.name}`,
+        initialCapturedAt: firstSegment.initialCapturedAt,
+        voyageStartedAt: firstSegment.voyageStartedAt,
+        warmupStartedAt: firstSegment.warmupStartedAt,
+        includeFullBackfill: firstSegment.includeFullBackfill,
       });
     }
     const filePath = await resolveCaptureOrClip(fileName, normalizedKind);
@@ -901,6 +948,10 @@ module.exports = function ajrmMarineLogger(app) {
     sourceKind,
     voyageFileName,
     displayFileName,
+    initialCapturedAt,
+    voyageStartedAt,
+    warmupStartedAt,
+    includeFullBackfill = false,
   }) {
     const playbackFilePath = isCompressedLogName(filePath)
       ? await materializeCompressedPlaybackFile(filePath)
@@ -924,9 +975,24 @@ module.exports = function ajrmMarineLogger(app) {
       to: metadata.to,
       current: metadata.from,
       cursor: 0,
+      startCursor: 0,
+      startCapturedAt: metadata.from,
+      captureFrom: metadata.from,
+      captureTo: metadata.to,
+      voyageStartedAt: voyageStartedAt || null,
+      warmupStartedAt: warmupStartedAt || null,
+      includeFullBackfill: includeFullBackfill === true,
       offsets: metadata.offsets,
       times: metadata.times,
     };
+    if (initialCapturedAt) {
+      const position = findLineAtOrAfter(Date.parse(initialCapturedAt));
+      playback.cursor = position.lineIndex;
+      playback.current = position.capturedAt || metadata.from;
+      playback.from = playback.current;
+      playback.startCursor = playback.cursor;
+      playback.startCapturedAt = playback.current;
+    }
     addEvent("playback-loaded", `Loaded ${playback.displayFileName}`);
     return getPlaybackSummary();
   }
@@ -962,7 +1028,7 @@ module.exports = function ajrmMarineLogger(app) {
       .map((name) => fs.promises.unlink(path.join(cacheDirectory, name)).catch(() => {})));
   }
 
-  async function prepareVoyagePlayback(fileName) {
+  async function prepareVoyagePlayback(fileName, playbackOptions = {}) {
     if (!/\.zip$/i.test(fileName)) {
       throw new Error("Voyage playback currently supports .zip voyage bundles");
     }
@@ -971,6 +1037,7 @@ module.exports = function ajrmMarineLogger(app) {
     const statsInfo = await fs.promises.stat(sourcePath).catch(() => null);
     if (!statsInfo?.isFile()) throw new Error(`Voyage not found: ${fileName}`);
     await assertSafeZipEntries(sourcePath, fileName);
+    const index = await readVoyageZipIndex(sourcePath);
 
     const replayDirectory = path.join(paths.voyageReplay, safeReplayDirectoryName(fileName));
     await fs.promises.rm(replayDirectory, { recursive: true, force: true });
@@ -995,12 +1062,45 @@ module.exports = function ajrmMarineLogger(app) {
     if (!segments.length) {
       throw new Error(`Voyage ${fileName} does not contain any CapturePlus recording segments`);
     }
-    const first = segments[0];
+    const entries = [];
+    for (const segment of segments) {
+      const fullPath = path.join(directory, segment.name);
+      const metadata = await recordingListMetadata(fullPath, segment);
+      entries.push({
+        ...segment,
+        fullPath,
+        directory,
+        from: metadata.from,
+        to: metadata.to,
+      });
+    }
+    const includeFullBackfill = playbackOptions.includeFullBackfill === true;
+    const warmupStartedAt = includeFullBackfill
+      ? null
+      : replayWarmupStart(index, options.replayWarmupMinutes);
+    const targetMs = Date.parse(warmupStartedAt);
+    const first = Number.isFinite(targetMs)
+      ? entries.find((entry) => {
+          const toMs = Date.parse(entry.to || entry.from);
+          return Number.isFinite(toMs) && toMs >= targetMs;
+        }) || entries[entries.length - 1]
+      : entries[0];
     return {
       name: first.name,
-      fullPath: path.join(directory, first.name),
+      fullPath: first.fullPath,
       directory,
+      initialCapturedAt: includeFullBackfill ? null : warmupStartedAt,
+      voyageStartedAt: index?.startedAt || null,
+      warmupStartedAt,
+      includeFullBackfill,
     };
+  }
+
+  function replayWarmupStart(index, warmupMinutes) {
+    const voyageStartMs = Date.parse(index?.startedAt);
+    if (!Number.isFinite(voyageStartMs)) return null;
+    const minutes = clampInt(warmupMinutes, 7, 0, 1440);
+    return new Date(voyageStartMs - minutes * 60 * 1000).toISOString();
   }
 
   async function linkReferencedVoyageSegments(sourcePath, voyageFileName, directory) {
@@ -1122,8 +1222,8 @@ module.exports = function ajrmMarineLogger(app) {
     playback.timer = null;
     playback.active = false;
     playback.paused = false;
-    playback.cursor = 0;
-    playback.current = playback.from;
+    playback.cursor = playback.startCursor || 0;
+    playback.current = playback.startCapturedAt || playback.from;
     playback.previousTs = null;
     playback.lastLineWallMs = null;
     playback.lastReason = reason;
@@ -1258,6 +1358,9 @@ module.exports = function ajrmMarineLogger(app) {
       displayFileName: playback.voyageFileName
         ? `${playback.voyageFileName} / ${nextFile.name}`
         : nextFile.name,
+      voyageStartedAt: playback.voyageStartedAt,
+      warmupStartedAt: playback.warmupStartedAt,
+      includeFullBackfill: playback.includeFullBackfill,
     });
     playback.rate = rate;
     playback.active = true;
@@ -1783,9 +1886,15 @@ module.exports = function ajrmMarineLogger(app) {
 
   function findLineAtOrAfter(targetMs) {
     const times = playback.times || [];
+    if (!times.length) {
+      return { lineIndex: 0, capturedAt: playback.from };
+    }
+    if (!Number.isFinite(targetMs)) {
+      return { lineIndex: 0, capturedAt: playback.from };
+    }
     let low = 0;
     let high = times.length - 1;
-    let best = 0;
+    let best = times.length - 1;
     while (low <= high) {
       const mid = Math.floor((low + high) / 2);
       if (times[mid] >= targetMs) {
@@ -1832,9 +1941,16 @@ module.exports = function ajrmMarineLogger(app) {
       displayFileName: null,
       totalLines: 0,
       cursor: 0,
+      startCursor: 0,
       from: null,
       to: null,
       current: null,
+      startCapturedAt: null,
+      captureFrom: null,
+      captureTo: null,
+      voyageStartedAt: null,
+      warmupStartedAt: null,
+      includeFullBackfill: false,
       rate: 1,
       previousTs: null,
       sourceAnchorMs: null,
@@ -1875,6 +1991,13 @@ module.exports = function ajrmMarineLogger(app) {
       from: playback.from,
       to: playback.to,
       current: playback.current,
+      captureFrom: playback.captureFrom,
+      captureTo: playback.captureTo,
+      voyageStartedAt: playback.voyageStartedAt,
+      warmupStartedAt: playback.warmupStartedAt,
+      warmupActive: isPlaybackWarmupActive(),
+      includeFullBackfill: playback.includeFullBackfill,
+      replayWarmupMinutes: options.replayWarmupMinutes,
       rate: playback.rate,
       lastReason: playback.lastReason,
       compressed: isCompressedLogName(playback.fileName || ""),
@@ -1899,6 +2022,10 @@ module.exports = function ajrmMarineLogger(app) {
                     displayFileName: playback.displayFileName || playback.fileName,
                     sourceKind: playback.sourceKind,
                     voyageFileName: playback.voyageFileName,
+                    voyageStartedAt: playback.voyageStartedAt,
+                    warmupStartedAt: playback.warmupStartedAt,
+                    warmupActive: isPlaybackWarmupActive(),
+                    includeFullBackfill: playback.includeFullBackfill,
                     playing: playback.active,
                     rate: playback.rate,
                   }
@@ -1908,12 +2035,24 @@ module.exports = function ajrmMarineLogger(app) {
                     displayFileName: playback.displayFileName || playback.fileName,
                     sourceKind: playback.sourceKind,
                     voyageFileName: playback.voyageFileName,
+                    voyageStartedAt: playback.voyageStartedAt,
+                    warmupStartedAt: playback.warmupStartedAt,
+                    warmupActive: false,
+                    includeFullBackfill: playback.includeFullBackfill,
                   },
             },
           ],
         },
       ],
     });
+  }
+
+  function isPlaybackWarmupActive() {
+    const voyageStartMs = Date.parse(playback.voyageStartedAt);
+    const currentMs = Date.parse(playback.current);
+    return Number.isFinite(voyageStartMs)
+      && Number.isFinite(currentMs)
+      && currentMs < voyageStartMs;
   }
 
   function parseSeekTarget(target) {
