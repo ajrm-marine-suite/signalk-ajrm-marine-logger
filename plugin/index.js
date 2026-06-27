@@ -1174,7 +1174,10 @@ module.exports = function ajrmMarineLogger(app) {
       playback.cursor += 1;
       playback.current = entry.capturedAt;
       publishPlaybackClock(true);
-      app.handleMessage(plugin.id, replayDeltaWithCurrentTimestamps(entry.delta));
+      const replayDelta = replayDeltaAsLiveInputs(entry.delta);
+      if (replayDelta) {
+        app.handleMessage(plugin.id, replayDelta);
+      }
       stats.playbackSent += 1;
 
       const currentMs = Date.parse(entry.capturedAt);
@@ -1998,15 +2001,82 @@ function getDeltaTimestamp(delta) {
   return firstUpdate?.timestamp || delta?.timestamp || null;
 }
 
-function replayDeltaWithCurrentTimestamps(delta, timestamp = new Date().toISOString()) {
+function replayDeltaAsLiveInputs(delta, timestamp = new Date().toISOString()) {
   if (!delta || typeof delta !== "object" || !Array.isArray(delta.updates)) return delta;
+  const updates = delta.updates
+    .map((update) => replayUpdateAsLiveInputs(update, timestamp))
+    .filter(Boolean);
+  if (!updates.length) return null;
   return {
     ...delta,
-    updates: delta.updates.map((update) => ({
-      ...update,
-      timestamp,
-    })),
+    updates,
   };
+}
+
+function replayUpdateAsLiveInputs(update, timestamp) {
+  if (!update || typeof update !== "object") return null;
+  const values = Array.isArray(update.values)
+    ? update.values
+        .filter((entry) => shouldReplayInputPath(entry?.path))
+        .map((entry) => replayEntryAsLiveInput(entry, timestamp))
+        .filter(Boolean)
+    : [];
+  if (!values.length) return null;
+  return {
+    ...update,
+    timestamp,
+    values,
+  };
+}
+
+function replayEntryAsLiveInput(entry, timestamp) {
+  const value = refreshEmbeddedSignalKTimestamp(
+    stripDerivedReplayFields(entry.value),
+    timestamp,
+  );
+  if (isEmptyReplayValue(value)) return null;
+  return {
+    ...entry,
+    value,
+  };
+}
+
+function shouldReplayInputPath(pathName) {
+  const pathText = String(pathName || "");
+  if (!pathText) return true;
+  if (pathText === PLAYBACK_CLOCK_PATH) return false;
+  if (pathText === "notifications" || pathText.startsWith("notifications.")) return false;
+  if (pathText === "plugins" || pathText.startsWith("plugins.")) return false;
+  return true;
+}
+
+function stripDerivedReplayFields(value) {
+  if (Array.isArray(value)) return value.map(stripDerivedReplayFields);
+  if (!value || typeof value !== "object") return value;
+  const output = {};
+  Object.entries(value).forEach(([key, child]) => {
+    if (key === "plugins" || key === "notifications") return;
+    output[key] = stripDerivedReplayFields(child);
+  });
+  return output;
+}
+
+function refreshEmbeddedSignalKTimestamp(value, timestamp) {
+  if (Array.isArray(value)) return value.map((item) => refreshEmbeddedSignalKTimestamp(item, timestamp));
+  if (!value || typeof value !== "object") return value;
+  const output = {};
+  Object.entries(value).forEach(([key, child]) => {
+    if (key === "timestamp" && typeof child === "string") {
+      output[key] = timestamp;
+    } else {
+      output[key] = refreshEmbeddedSignalKTimestamp(child, timestamp);
+    }
+  });
+  return output;
+}
+
+function isEmptyReplayValue(value) {
+  return value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0;
 }
 
 function expandHome(value) {
@@ -2134,4 +2204,6 @@ async function readLineAtOffset(filePath, offset) {
 module.exports._test = {
   calculatePlaybackDelayMs,
   normalizePlaybackRate,
+  replayDeltaAsLiveInputs,
+  shouldReplayInputPath,
 };

@@ -5,6 +5,10 @@
 AJRM Marine Logger is a Signal K diagnostic capture and replay plugin intended for
 AJRM Marine testing on a Signal K vessel server.
 
+Version `0.5.6` makes playback act as a live input simulator: raw input paths
+are replayed with fresh Signal K timestamps, while derived `plugins.*` and
+`notifications.*` paths are not republished into the active system.
+
 Version `0.5.5` anchors numeric playback speeds to the source recording clock,
 so 10x and 20x stay throttled when the Pi has headroom but catch up instead of
 accumulating timer overhead when replay falls behind.
@@ -69,7 +73,7 @@ The file browser has **Logs**, **Clips**, and **Voyages** tabs. Logs are full ca
 
 ```bash
 cd ~/.signalk
-npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.5.5 --omit=dev --no-package-lock
+npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.5.6 --omit=dev --no-package-lock
 sudo systemctl restart signalk
 ```
 
@@ -97,7 +101,7 @@ The legacy `/plugins/signalk-ajrm-marine-logger/...` route still exists for comp
 - The rolling buffer is always maintained while the plugin is enabled.
 - Capture and playback are mutually exclusive, so replayed deltas are not recorded back into a capture.
 - Playback publishes `plugins.ajrmMarineLogger.playback` as a replay clock so AJRM Marine can show an explicit replay badge and avoid guessing from stale timestamps. The value includes whether playback is active/playing, the recording time, file name, display file name, source kind, voyage name when applicable, and rate; speed changes are published dynamically while playback is running.
-- Playback injects captured deltas back into Signal K with `app.handleMessage`.
+- Playback injects captured raw input deltas back into Signal K with `app.handleMessage`, using fresh replay-time update timestamps and refreshed embedded source timestamps. Derived `plugins.*` and `notifications.*` paths are recorded for forensic use but are not republished during normal playback, so current apps recompute derived state from the replayed inputs.
 - Capture files are newline-delimited JSON, optionally gzip-compressed once complete. Each line contains the capture timestamp and the original Signal K delta.
 - Save Clip copies a named selected time range into a new JSONL file under `clips/`. Clips can be created while capture is still running, and a clip time range can span multiple hourly log files. If no individual log is selected, Save Clip searches the full log set and excludes existing clips from the source range.
 

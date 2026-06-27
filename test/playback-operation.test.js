@@ -15,7 +15,11 @@ const {
 } = require("../plugin/playback-operation");
 
 const execFile = promisify(execFileCallback);
-const { calculatePlaybackDelayMs } = startPlugin._test;
+const {
+  calculatePlaybackDelayMs,
+  replayDeltaAsLiveInputs,
+  shouldReplayInputPath,
+} = startPlugin._test;
 
 test("stopping invalidates an in-flight playback operation", () => {
   const operation = createPlaybackOperation();
@@ -72,6 +76,151 @@ test("max playback never applies timing delay", () => {
     }),
     0,
   );
+});
+
+test("playback republishes raw inputs with fresh timestamps and drops derived paths", () => {
+  const replayed = replayDeltaAsLiveInputs(
+    {
+      context: "vessels.self",
+      updates: [
+        {
+          timestamp: "2026-06-24T10:00:00.000Z",
+          values: [
+            {
+              path: "navigation.position",
+              value: {
+                value: { latitude: 56.2, longitude: -5.5 },
+                timestamp: "2026-06-24T10:00:00.000Z",
+                values: {
+                  gps: {
+                    value: { latitude: 56.2, longitude: -5.5 },
+                    timestamp: "2026-06-24T10:00:00.000Z",
+                  },
+                },
+              },
+            },
+            {
+              path: "notifications.navigation.gnss.integrity",
+              value: {
+                state: "alarm",
+                message: "Old GPS integrity warning",
+              },
+            },
+            {
+              path: "plugins.ajrmMarineGpsIntegrity.trusted.timestamp",
+              value: "2026-06-24T10:00:00.000Z",
+            },
+          ],
+        },
+      ],
+    },
+    "2026-06-27T12:00:00.000Z",
+  );
+
+  assert.equal(replayed.updates.length, 1);
+  assert.equal(replayed.updates[0].timestamp, "2026-06-27T12:00:00.000Z");
+  assert.deepEqual(
+    replayed.updates[0].values.map((entry) => entry.path),
+    ["navigation.position"],
+  );
+  assert.equal(replayed.updates[0].values[0].value.timestamp, "2026-06-27T12:00:00.000Z");
+  assert.equal(
+    replayed.updates[0].values[0].value.values.gps.timestamp,
+    "2026-06-27T12:00:00.000Z",
+  );
+});
+
+test("playback strips derived fields from root vessel deltas", () => {
+  const replayed = replayDeltaAsLiveInputs(
+    {
+      context: "vessels.self",
+      updates: [
+        {
+          timestamp: "2026-06-24T10:00:00.000Z",
+          values: [
+            {
+              path: "",
+              value: {
+                name: "Test Boat",
+                navigation: {
+                  speedOverGround: {
+                    value: 2.5,
+                    timestamp: "2026-06-24T10:00:00.000Z",
+                  },
+                },
+                notifications: {
+                  navigation: {
+                    gnss: {
+                      integrity: {
+                        value: { state: "alarm" },
+                      },
+                    },
+                  },
+                },
+                plugins: {
+                  ajrmMarineGpsIntegrity: {
+                    trusted: {
+                      timestamp: {
+                        value: "2026-06-24T10:00:00.000Z",
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          ],
+        },
+      ],
+    },
+    "2026-06-27T12:00:00.000Z",
+  );
+
+  assert.equal(replayed.updates[0].values[0].path, "");
+  assert.equal(replayed.updates[0].values[0].value.name, "Test Boat");
+  assert.equal(replayed.updates[0].values[0].value.notifications, undefined);
+  assert.equal(replayed.updates[0].values[0].value.plugins, undefined);
+  assert.equal(
+    replayed.updates[0].values[0].value.navigation.speedOverGround.timestamp,
+    "2026-06-27T12:00:00.000Z",
+  );
+});
+
+test("playback drops root deltas that contain only derived state", () => {
+  const replayed = replayDeltaAsLiveInputs(
+    {
+      context: "vessels.self",
+      updates: [
+        {
+          timestamp: "2026-06-24T10:00:00.000Z",
+          values: [
+            {
+              path: "",
+              value: {
+                plugins: {
+                  ajrmMarineCapture: { state: { value: "watching" } },
+                },
+                notifications: {
+                  navigation: { gnss: { integrity: { value: { state: "alarm" } } } },
+                },
+              },
+            },
+          ],
+        },
+      ],
+    },
+    "2026-06-27T12:00:00.000Z",
+  );
+
+  assert.equal(replayed, null);
+});
+
+test("playback input path classification keeps raw paths and rejects derived paths", () => {
+  assert.equal(shouldReplayInputPath("navigation.position"), true);
+  assert.equal(shouldReplayInputPath("environment.wind.speedApparent"), true);
+  assert.equal(shouldReplayInputPath(""), true);
+  assert.equal(shouldReplayInputPath("notifications.navigation.gnss.integrity"), false);
+  assert.equal(shouldReplayInputPath("plugins.ajrmMarineGpsIntegrity.trusted.timestamp"), false);
+  assert.equal(shouldReplayInputPath("plugins.ajrmMarineLogger.playback"), false);
 });
 
 test("voyage status ignores Voyage Viewer plot sidecars", async () => {

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.6
+
+- Replay raw input paths as live-looking Signal K data with fresh update and embedded source timestamps.
+- Stop republishing derived `plugins.*` and `notifications.*` paths during playback, while still recording them for forensic debugging.
+
 ## 0.5.5
 
 - Anchor numeric playback speeds to the source recording clock so high-speed replay catches up when it falls behind instead of accumulating timer overhead.
