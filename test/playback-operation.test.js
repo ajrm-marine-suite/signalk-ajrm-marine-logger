@@ -236,7 +236,7 @@ test("voyage status ignores Voyage Viewer plot sidecars", async () => {
     const voyagesDir = path.join(root, "voyages");
     await fs.writeFile(path.join(voyagesDir, "voyage-20260622T203128Z.zip"), "zip placeholder");
     await fs.writeFile(
-      path.join(voyagesDir, "voyage-20260622T203128Z.zip.watchkeeper-plot.json"),
+      path.join(voyagesDir, "voyage-20260622T203128Z.zip.ajrm-marine-plot.json"),
       "{}",
     );
 

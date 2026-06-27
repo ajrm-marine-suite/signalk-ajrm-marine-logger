@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.9
+
+- Update Voyage Viewer sidecar regression fixtures to the AJRM Marine plot-cache suffix.
+
 ## 0.5.8
 
 - Add a configurable voyage replay warm-up window, defaulting to seven minutes, so normal replay primes AIS/static data without replaying the whole debug backfill.
