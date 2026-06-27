@@ -902,15 +902,18 @@ module.exports = function ajrmMarineLogger(app) {
     voyageFileName,
     displayFileName,
   }) {
-    const statsInfo = await fs.promises.stat(filePath).catch(() => null);
-    const metadata = await scanFile(filePath, Infinity, true);
+    const playbackFilePath = isCompressedLogName(filePath)
+      ? await materializeCompressedPlaybackFile(filePath)
+      : filePath;
+    const statsInfo = await fs.promises.stat(playbackFilePath).catch(() => null);
+    const metadata = await scanFile(playbackFilePath, Infinity, true);
     if (statsInfo?.isFile()) {
-      await writeRecordingMetadataFile(filePath, statsInfo, metadata);
+      await writeRecordingMetadataFile(playbackFilePath, statsInfo, metadata);
     }
     playback = {
       ...createPlaybackState(),
       fileName,
-      filePath,
+      filePath: playbackFilePath,
       sourceDirectory,
       sourceKind,
       voyageFileName: voyageFileName || null,
@@ -926,6 +929,37 @@ module.exports = function ajrmMarineLogger(app) {
     };
     addEvent("playback-loaded", `Loaded ${playback.displayFileName}`);
     return getPlaybackSummary();
+  }
+
+  async function materializeCompressedPlaybackFile(compressedPath) {
+    const statsInfo = await fs.promises.stat(compressedPath).catch(() => null);
+    if (!statsInfo?.isFile()) return compressedPath;
+    const cacheDirectory = path.join(paths.voyageReplay, "compressed-captures");
+    await fs.promises.mkdir(cacheDirectory, { recursive: true });
+    const baseName = safeReplayDirectoryName(path.basename(compressedPath).replace(/\.gz$/i, ""));
+    const cacheName = `${baseName}.${statsInfo.size}.${Math.round(statsInfo.mtimeMs)}.jsonl`;
+    const cachePath = path.join(cacheDirectory, cacheName);
+    const existing = await fs.promises.stat(cachePath).catch(() => null);
+    if (existing?.isFile() && existing.size > 0) return cachePath;
+
+    const temporaryPath = `${cachePath}.${process.pid}.${Date.now()}.tmp`;
+    await pipeline(
+      fs.createReadStream(compressedPath),
+      zlib.createGunzip(),
+      fs.createWriteStream(temporaryPath),
+    );
+    await fs.promises.rename(temporaryPath, cachePath);
+    pruneCompressedPlaybackCache(cacheDirectory, cachePath).catch((error) => {
+      app.debug?.(`[${plugin.id}] compressed playback cache prune failed: ${error.message}`);
+    });
+    return cachePath;
+  }
+
+  async function pruneCompressedPlaybackCache(cacheDirectory, keepPath) {
+    const files = await fs.promises.readdir(cacheDirectory).catch(() => []);
+    await Promise.all(files
+      .filter((name) => name.endsWith(".jsonl") && path.join(cacheDirectory, name) !== keepPath)
+      .map((name) => fs.promises.unlink(path.join(cacheDirectory, name)).catch(() => {})));
   }
 
   async function prepareVoyagePlayback(fileName) {

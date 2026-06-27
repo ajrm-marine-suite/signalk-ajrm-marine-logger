@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.7
+
+- Materialise compressed `.jsonl.gz` captures into Logger's replay cache before
+  playback, so direct capture replay uses line offsets instead of repeatedly
+  rescanning gzip streams.
+
 ## 0.5.6
 
 - Replay raw input paths as live-looking Signal K data with fresh update and embedded source timestamps.
