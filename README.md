@@ -73,7 +73,7 @@ The file browser has **Logs**, **Clips**, and **Voyages** tabs. Logs are full ca
 
 ```bash
 cd ~/.signalk
-npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.5.11 --omit=dev --no-package-lock
+npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.5.12 --omit=dev --no-package-lock
 sudo systemctl restart signalk
 ```
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.12
+
+- Align web asset cache keys and install documentation with the package version.
+
 ## 0.5.11
 
 - Add Signal K AppStore utility category metadata.
