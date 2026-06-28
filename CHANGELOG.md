@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.11
+
+- Add Signal K AppStore utility category metadata.
+
 ## 0.5.10
 
 - Rename remaining Logger UI, device, status, and storage defaults to AJRM Marine naming while retaining legacy-directory compatibility on upgraded Pis.
