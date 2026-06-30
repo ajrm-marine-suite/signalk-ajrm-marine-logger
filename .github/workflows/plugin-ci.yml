@@ -1,0 +1,13 @@
+name: Signal K Plugin CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  plugin-ci:
+    uses: SignalK/signalk-server/.github/workflows/plugin-ci.yml@c86334b331c6e33b57ab1759407d01c15e94c583

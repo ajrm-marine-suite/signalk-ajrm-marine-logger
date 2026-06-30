@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.13
+
+- Add Signal K AppStore relationship metadata for the voyage debug mini-suite:
+  Capture and Voyage Viewer.
+- Add the reusable Signal K plugin CI workflow.
+
 ## 0.5.12
 
 - Align web asset cache keys and install documentation with the package version.
