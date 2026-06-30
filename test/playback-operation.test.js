@@ -1,20 +1,18 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const { execFile: execFileCallback } = require("node:child_process");
 const EventEmitter = require("node:events");
 const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const { promisify } = require("node:util");
 const zlib = require("node:zlib");
+const AdmZip = require("adm-zip");
 const startPlugin = require("../plugin");
 const {
   createPlaybackOperation,
 } = require("../plugin/playback-operation");
 
-const execFile = promisify(execFileCallback);
 const {
   calculatePlaybackDelayMs,
   replayDeltaAsLiveInputs,
@@ -287,9 +285,7 @@ test("voyage playback loads local reference capture segments", async () => {
         ],
       })}\n`,
     );
-    await execFile("zip", ["-qr", path.join(voyagesDir, "voyage-20260626T185915Z.zip"), "."], {
-      cwd: staging,
-    });
+    await writeZip(path.join(voyagesDir, "voyage-20260626T185915Z.zip"), staging, ["index.json"]);
 
     const response = await invoke(routes, "POST", "/playback/load", {
       file: "voyage-20260626T185915Z.zip",
@@ -353,9 +349,7 @@ test("voyage playback starts at configured warm-up when long backfill exists", a
         ],
       })}\n`,
     );
-    await execFile("zip", ["-qr", path.join(voyagesDir, "voyage-20260626T184348Z.zip"), "."], {
-      cwd: staging,
-    });
+    await writeZip(path.join(voyagesDir, "voyage-20260626T184348Z.zip"), staging, ["index.json"]);
 
     const response = await invoke(routes, "POST", "/playback/load", {
       file: "voyage-20260626T184348Z.zip",
@@ -416,9 +410,7 @@ test("voyage playback can include full backfill for debugging", async () => {
         ],
       })}\n`,
     );
-    await execFile("zip", ["-qr", path.join(voyagesDir, "voyage-20260626T184348Z.zip"), "."], {
-      cwd: staging,
-    });
+    await writeZip(path.join(voyagesDir, "voyage-20260626T184348Z.zip"), staging, ["index.json"]);
 
     const response = await invoke(routes, "POST", "/playback/load", {
       file: "voyage-20260626T184348Z.zip",
@@ -590,4 +582,14 @@ function powerIntentDelta() {
       },
     ],
   };
+}
+
+async function writeZip(zipPath, rootDir, relativePaths) {
+  const zip = new AdmZip();
+  for (const relativePath of relativePaths) {
+    const zipPathName = relativePath.split(path.sep).join("/");
+    const data = await fs.readFile(path.join(rootDir, relativePath));
+    zip.addFile(zipPathName, data);
+  }
+  zip.writeZip(zipPath);
 }

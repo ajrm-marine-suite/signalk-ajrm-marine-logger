@@ -6,6 +6,7 @@ const readline = require("node:readline");
 const util = require("node:util");
 const zlib = require("node:zlib");
 const { pipeline } = require("node:stream/promises");
+const AdmZip = require("adm-zip");
 const packageInfo = require("../package.json");
 const { createPlaybackOperation } = require("./playback-operation");
 
@@ -1045,10 +1046,7 @@ module.exports = function ajrmMarineLogger(app) {
     await fs.promises.rm(replayDirectory, { recursive: true, force: true });
     await fs.promises.mkdir(replayDirectory, { recursive: true });
     try {
-      await execFile("unzip", ["-q", "-o", sourcePath, "-d", replayDirectory], {
-        timeout: 120000,
-        maxBuffer: 1024 * 1024,
-      });
+      extractZipToDirectory(sourcePath, replayDirectory);
     } catch (error) {
       throw new Error(`Unable to extract voyage ${fileName}: ${error.message || error}`);
     }
@@ -2138,35 +2136,44 @@ function safeReplayDirectoryName(fileName) {
 }
 
 async function assertSafeZipEntries(filePath, fileName) {
-  let stdout = "";
   try {
-    const result = await execFile("unzip", ["-Z1", filePath], {
-      timeout: 30000,
-      maxBuffer: 4 * 1024 * 1024,
-    });
-    stdout = result.stdout || "";
+    const unsafe = zipEntryNames(filePath)
+      .find((entry) => unsafeZipEntryName(entry));
+    if (unsafe) {
+      throw new Error(`Voyage ${fileName} contains an unsafe archive path: ${unsafe}`);
+    }
   } catch (error) {
     throw new Error(`Unable to inspect voyage ${fileName}: ${error.message || error}`);
-  }
-  const unsafe = stdout
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .find((entry) => path.isAbsolute(entry) || entry.split(/[\\/]+/).includes(".."));
-  if (unsafe) {
-    throw new Error(`Voyage ${fileName} contains an unsafe archive path: ${unsafe}`);
   }
 }
 
 async function readVoyageZipIndex(filePath) {
   try {
-    const result = await execFile("unzip", ["-p", filePath, "index.json"], {
-      timeout: 10000,
-      maxBuffer: 1024 * 1024,
-    });
-    return JSON.parse(result.stdout || "");
+    const zip = new AdmZip(filePath);
+    const entry = zip.getEntry("index.json");
+    if (!entry || entry.isDirectory) return null;
+    return JSON.parse(entry.getData().toString("utf8"));
   } catch (_error) {
     return null;
   }
+}
+
+function zipEntryNames(filePath) {
+  return new AdmZip(filePath).getEntries().map((entry) => entry.entryName);
+}
+
+function unsafeZipEntryName(entryName) {
+  return path.isAbsolute(entryName) || entryName.split(/[\\/]+/).includes("..");
+}
+
+function extractZipToDirectory(filePath, directory) {
+  const zip = new AdmZip(filePath);
+  for (const entry of zip.getEntries()) {
+    if (unsafeZipEntryName(entry.entryName)) {
+      throw new Error(`unsafe archive path: ${entry.entryName}`);
+    }
+  }
+  zip.extractAllTo(directory, true);
 }
 
 function normalizeComment(value) {

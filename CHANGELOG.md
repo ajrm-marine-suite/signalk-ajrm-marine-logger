@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.14
+
+- Replace external `unzip` archive extraction and test ZIP fixture creation
+  with pure JavaScript ZIP handling, so voyage replay works on clean
+  cross-platform installs and Windows CI.
+
 ## 0.5.13
 
 - Add Signal K AppStore relationship metadata for the voyage debug mini-suite:
