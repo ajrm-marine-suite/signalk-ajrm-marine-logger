@@ -1,6 +1,6 @@
 {
   "name": "signalk-ajrm-marine-logger",
-  "version": "0.5.14",
+  "version": "0.5.15",
   "description": "Signal K logging and replay utility for AJRM Marine Suite testing.",
   "main": "plugin/index.js",
   "scripts": {
@@ -20,7 +20,7 @@
     "navigation"
   ],
   "author": "Anthony McDonald, with assistance from William McAusland",
-  "license": "MIT",
+  "license": "AGPL-3.0-or-later",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git"
