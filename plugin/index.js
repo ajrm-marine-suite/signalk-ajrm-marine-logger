@@ -382,9 +382,19 @@ module.exports = function ajrmMarineLogger(app) {
     }));
 
     router.get(`${prefix}/files/:kind/:file/download`, async (req, res) => {
+      let captureDownload = null;
       try {
         const kind = normalizeRecordingKind(req.params.kind);
         const fileName = safeBaseName(req.params.file);
+        if (kind === "voyages") {
+          captureDownload = await prepareCaptureVoyageDownload(fileName);
+          if (captureDownload) {
+            res.download(captureDownload.path, captureDownload.fileName, () => {
+              captureDownload.cleanup().catch(() => {});
+            });
+            return;
+          }
+        }
         const filePath = path.join(recordingDirectoryForKind(kind), fileName);
         const statsInfo = await fs.promises.stat(filePath).catch(() => null);
         if (!statsInfo?.isFile()) {
@@ -393,6 +403,7 @@ module.exports = function ajrmMarineLogger(app) {
         }
         res.download(filePath, fileName);
       } catch (error) {
+        if (captureDownload) captureDownload.cleanup().catch(() => {});
         res.status(400).json({ ok: false, error: error.message });
       }
     });
@@ -462,6 +473,16 @@ module.exports = function ajrmMarineLogger(app) {
       includePaths: normalizeIncludePaths(value.includePaths),
       statusRefreshSeconds: clampInt(value.statusRefreshSeconds, 2, 1, 60),
     };
+  }
+
+  async function prepareCaptureVoyageDownload(fileName) {
+    const api = app.ajrmMarineCaptureApi;
+    if (!api || typeof api.prepareVoyageDownload !== "function") return null;
+    try {
+      return await api.prepareVoyageDownload(fileName);
+    } catch {
+      return null;
+    }
   }
 
   function normalizeIncludePaths(value) {

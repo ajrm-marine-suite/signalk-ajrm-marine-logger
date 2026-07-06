@@ -76,6 +76,14 @@ test("max playback never applies timing delay", () => {
   );
 });
 
+test("voyage downloads defer to Capture portable bundle builder when available", async () => {
+  const source = await fs.readFile(path.join(__dirname, "..", "plugin", "index.js"), "utf8");
+  assert.match(source, /prepareCaptureVoyageDownload\(fileName\)/);
+  assert.match(source, /api\.prepareVoyageDownload\(fileName\)/);
+  assert.match(source, /kind === "voyages"/);
+  assert.match(source, /captureDownload\.cleanup\(\)/);
+});
+
 test("playback republishes raw inputs with fresh timestamps and drops derived paths", () => {
   const replayed = replayDeltaAsLiveInputs(
     {
@@ -243,6 +251,50 @@ test("voyage status ignores Voyage Viewer plot sidecars", async () => {
       status.voyages.map((voyage) => voyage.fileName),
       ["voyage-20260622T203128Z.zip"],
     );
+  } finally {
+    plugin.stop();
+  }
+});
+
+test("clip extraction reads gzipped capture segments", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-clip-gzip-"));
+  const app = fakeApp();
+  const routes = new Map();
+  const plugin = startPlugin(app);
+  plugin.registerWithRouter(routerMap(routes));
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+  });
+
+  try {
+    const capturesDir = path.join(root, "captures");
+    const captureName = "capture-2026-07-06T16-08-47-056Z.jsonl.gz";
+    const capturePath = path.join(capturesDir, captureName);
+    const envelopes = [
+      captureEnvelope("2026-07-06T16:08:47.056Z"),
+      captureEnvelope("2026-07-06T16:09:00.000Z"),
+      captureEnvelope("2026-07-06T16:09:30.000Z"),
+    ];
+    await fs.writeFile(
+      capturePath,
+      zlib.gzipSync(`${envelopes.map((entry) => JSON.stringify(entry)).join("\n")}\n`),
+    );
+
+    const response = await invoke(routes, "POST", "/clips/extract", {
+      file: captureName,
+      from: "2026-07-06T16:08:59.000Z",
+      to: "2026-07-06T16:09:01.000Z",
+      clipName: "gzip-clip-test",
+    });
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.clip.fileName, "gzip-clip-test.jsonl");
+    assert.equal(response.body.clip.lines, 1);
+    const clipPath = path.join(root, "clips", response.body.clip.fileName);
+    const clipText = await fs.readFile(clipPath, "utf8");
+    assert.match(clipText, /2026-07-06T16:09:00.000Z/);
   } finally {
     plugin.stop();
   }

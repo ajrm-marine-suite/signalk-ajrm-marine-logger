@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.16
+
+- When AJRM Marine Capture is installed, use Capture's canonical portable
+  voyage download builder for voyage ZIP downloads from Logger.
+- Add regression coverage that clip extraction still reads gzipped capture
+  segments from current voyage/capture formats.
+
 ## 0.5.14
 
 - Replace external `unzip` archive extraction and test ZIP fixture creation
