@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.18
+
+- Mark active capture recordings with `recording.active: true` in Logger status/API output so BITE and other apps can distinguish active recording from idle metadata.
+
 ## 0.5.17
 
 - Use the global AJRM Marine Capture API registry as a fallback when preparing

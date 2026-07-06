@@ -503,6 +503,7 @@ test("capture backfill ignores buffer files from before plugin start", async () 
 
   try {
     const recording = await app.ajrmMarineLoggerApi.startCapture({ backfillMinutes: 30 });
+    assert.equal(recording.active, true);
     assert.equal(recording.backfilled, 0);
     assert.equal(recording.lines, 0);
   } finally {
@@ -523,6 +524,7 @@ test("capture backfill keeps current plugin run buffer entries", async () => {
     app.signalk.emit("delta", captureDelta(new Date().toISOString()));
     await new Promise((resolve) => setTimeout(resolve, 25));
     const recording = await app.ajrmMarineLoggerApi.startCapture({ backfillMinutes: 30 });
+    assert.equal(recording.active, true);
     assert.equal(recording.backfilled, 1);
     assert.equal(recording.lines, 1);
   } finally {

@@ -1990,6 +1990,7 @@ module.exports = function ajrmMarineLogger(app) {
   function getRecordingSummary() {
     if (!recording) return null;
     return {
+      active: true,
       fileName: recording.fileName,
       startedAt: recording.startedAt,
       backfillMinutes: recording.backfillMinutes,
