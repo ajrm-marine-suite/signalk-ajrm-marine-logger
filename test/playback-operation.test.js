@@ -79,9 +79,12 @@ test("max playback never applies timing delay", () => {
 test("voyage downloads defer to Capture portable bundle builder when available", async () => {
   const source = await fs.readFile(path.join(__dirname, "..", "plugin", "index.js"), "utf8");
   assert.match(source, /prepareCaptureVoyageDownload\(fileName\)/);
+  assert.match(source, /globalThis\[AJRM_MARINE_CAPTURE_API_REGISTRY\]/);
   assert.match(source, /api\.prepareVoyageDownload\(fileName\)/);
   assert.match(source, /kind === "voyages"/);
+  assert.match(source, /logger-\$\{captureDownload\.fileName\}/);
   assert.match(source, /captureDownload\.cleanup\(\)/);
+  assert.match(source, /cannot safely download a complete voyage bundle from Logger/);
 });
 
 test("playback republishes raw inputs with fresh timestamps and drops derived paths", () => {

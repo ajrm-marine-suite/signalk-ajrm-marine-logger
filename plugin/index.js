@@ -16,6 +16,7 @@ const DEFAULT_LOG_DIRECTORY = "~/AJRMMarineLogs";
 const LEGACY_LOG_DIRECTORY = ["~/Capture", "PlusLogs"].join("");
 const RECORDING_METADATA_VERSION = 1;
 const AJRM_MARINE_LOGGER_API_REGISTRY = Symbol.for("mcdonaldajr.ajrmMarineLoggerApi");
+const AJRM_MARINE_CAPTURE_API_REGISTRY = Symbol.for("mcdonaldajr.ajrmMarineCaptureApi");
 const execFile = util.promisify(childProcess.execFile);
 
 module.exports = function ajrmMarineLogger(app) {
@@ -389,11 +390,12 @@ module.exports = function ajrmMarineLogger(app) {
         if (kind === "voyages") {
           captureDownload = await prepareCaptureVoyageDownload(fileName);
           if (captureDownload) {
-            res.download(captureDownload.path, captureDownload.fileName, () => {
+            res.download(captureDownload.path, `logger-${captureDownload.fileName}`, () => {
               captureDownload.cleanup().catch(() => {});
             });
             return;
           }
+          throw new Error("AJRM Marine Capture portable download API is unavailable; cannot safely download a complete voyage bundle from Logger.");
         }
         const filePath = path.join(recordingDirectoryForKind(kind), fileName);
         const statsInfo = await fs.promises.stat(filePath).catch(() => null);
@@ -476,11 +478,12 @@ module.exports = function ajrmMarineLogger(app) {
   }
 
   async function prepareCaptureVoyageDownload(fileName) {
-    const api = app.ajrmMarineCaptureApi;
+    const api = app.ajrmMarineCaptureApi || globalThis[AJRM_MARINE_CAPTURE_API_REGISTRY];
     if (!api || typeof api.prepareVoyageDownload !== "function") return null;
     try {
       return await api.prepareVoyageDownload(fileName);
-    } catch {
+    } catch (error) {
+      app.error(`[${plugin.id}] Capture portable voyage download failed: ${error.stack || error.message}`);
       return null;
     }
   }

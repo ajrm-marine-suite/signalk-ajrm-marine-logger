@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.17
+
+- Use the global AJRM Marine Capture API registry as a fallback when preparing
+  voyage downloads, so plugin start order does not silently produce lightweight
+  reference-mode ZIPs.
+- Fail clearly when a complete portable voyage bundle cannot be prepared,
+  instead of downloading an incomplete reference-mode bundle.
+- Prefix Logger voyage download filenames to make Capture, Logger, and Viewer
+  downloads distinguishable during comparison testing.
+
 ## 0.5.16
 
 - When AJRM Marine Capture is installed, use Capture's canonical portable
