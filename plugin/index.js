@@ -1311,6 +1311,22 @@ module.exports = function ajrmMarineLogger(app) {
     updateProviderStatus();
   }
 
+  function finishPlayback(reason) {
+    if (!playback.loaded) return;
+    playback.active = false;
+    playback.paused = false;
+    playback.lastReason = reason;
+    playback.previousTs = null;
+    playback.sourceAnchorMs = null;
+    playback.wallAnchorMs = null;
+    playback.lastLineWallMs = null;
+    playbackOperation.invalidate();
+    clearTimeout(playback.timer);
+    playback.timer = null;
+    publishPlaybackClock(false);
+    updateProviderStatus();
+  }
+
   function stopPlayback(reason) {
     if (!playback.loaded && !playback.active) return;
     resetPlaybackToStart(reason);
@@ -1359,7 +1375,7 @@ module.exports = function ajrmMarineLogger(app) {
       sendNextPlaybackLine(generation).catch((error) => {
         if (!playbackOperation.isCurrent(generation)) return;
         logError("playback failed", error);
-        pausePlayback(error.message);
+        finishPlayback(error.message);
       });
     }, Math.max(0, delayMs));
   }
@@ -1402,7 +1418,7 @@ module.exports = function ajrmMarineLogger(app) {
       }
       if (!entry) {
         if (await autoAdvancePlaybackSegment()) return;
-        pausePlayback("end of capture");
+        finishPlayback("end of capture");
         return;
       }
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.24
+
+- Clear the Logger playback Signal K projection when replay naturally ends or
+  fails, so Display does not keep showing a stale paused replay badge during
+  later live or simulated runs.
+
 ## 0.5.23
 
 - Keep the current file list visible during a playback load if a transient

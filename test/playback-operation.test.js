@@ -529,7 +529,13 @@ test("playback play restarts from the loaded start after reaching the end", asyn
     const endedStatus = await app.ajrmMarineLoggerApi.status();
     assert.equal(endedStatus.playback.cursor, 2);
     assert.equal(endedStatus.playback.active, false);
-    assert.equal(endedStatus.playback.paused, true);
+    assert.equal(endedStatus.playback.paused, false);
+    const playbackClockValues = app.messages
+      .flatMap((delta) => delta.updates || [])
+      .flatMap((update) => update.values || [])
+      .filter((entry) => entry.path === "plugins.ajrmMarineLogger.playback")
+      .map((entry) => entry.value);
+    assert.equal(playbackClockValues[playbackClockValues.length - 1].active, false);
 
     const replayResponse = await invoke(routes, "POST", "/playback/play", { rate: "max" });
     assert.equal(replayResponse.statusCode, 200);
@@ -661,10 +667,14 @@ test("AJRM Marine Pi Controller power intent closes active capture", async () =>
 });
 
 function fakeApp() {
+  const messages = [];
   return {
     signalk: new EventEmitter(),
+    messages,
     setPluginStatus() {},
-    handleMessage() {},
+    handleMessage(_pluginId, delta) {
+      messages.push(delta);
+    },
     debug() {},
     error() {},
   };
