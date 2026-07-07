@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.20
+
+- Add a playback Restart button that returns the loaded recording or voyage to
+  its replay start.
+- Make Play restart automatically when the loaded playback has already reached
+  the end, so replaying a voyage does not require a manual seek first.
+
 ## 0.5.19
 
 - Restyle the Log/Clip/Voyage selector as folder-style tabs, separate from the

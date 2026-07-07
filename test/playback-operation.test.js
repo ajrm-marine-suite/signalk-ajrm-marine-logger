@@ -485,6 +485,62 @@ test("voyage playback can include full backfill for debugging", async () => {
   }
 });
 
+test("playback play restarts from the loaded start after reaching the end", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-play-at-end-"));
+  const capturesDir = path.join(root, "captures");
+  await fs.mkdir(capturesDir, { recursive: true });
+  const captureName = "capture-2026-07-07T09-00-00-000Z.jsonl";
+  await fs.writeFile(
+    path.join(capturesDir, captureName),
+    `${[
+      captureEnvelope("2026-07-07T09:00:00.000Z"),
+      captureEnvelope("2026-07-07T09:00:01.000Z"),
+    ].map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+  );
+
+  const app = fakeApp();
+  const routes = new Map();
+  const plugin = startPlugin(app);
+  plugin.registerWithRouter(routerMap(routes));
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+    compressCompletedCaptures: false,
+  });
+
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const loadResponse = await invoke(routes, "POST", "/playback/load", {
+      file: captureName,
+      kind: "logs",
+    });
+    assert.equal(loadResponse.statusCode, 200);
+    assert.equal(loadResponse.body.playback.cursor, 0);
+
+    const firstPlay = await invoke(routes, "POST", "/playback/play", { rate: "max" });
+    assert.equal(firstPlay.statusCode, 200);
+    let lastPlayback = null;
+    await waitFor(async () => {
+      const status = await app.ajrmMarineLoggerApi.status();
+      lastPlayback = status.playback;
+      return status.playback.lastReason === "end of capture";
+    }, 1000, () => JSON.stringify(lastPlayback));
+
+    const endedStatus = await app.ajrmMarineLoggerApi.status();
+    assert.equal(endedStatus.playback.cursor, 2);
+    assert.equal(endedStatus.playback.active, false);
+    assert.equal(endedStatus.playback.paused, true);
+
+    const replayResponse = await invoke(routes, "POST", "/playback/play", { rate: "max" });
+    assert.equal(replayResponse.statusCode, 200);
+    assert.equal(replayResponse.body.playback.active, true);
+    assert.equal(replayResponse.body.playback.cursor, 0);
+    assert.equal(replayResponse.body.playback.current, "2026-07-07T09:00:00.000Z");
+  } finally {
+    plugin.stop();
+  }
+});
+
 test("capture backfill ignores buffer files from before plugin start", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-old-buffer-"));
   const bufferDir = path.join(root, "buffer");
@@ -592,6 +648,15 @@ async function invoke(routes, method, route, body = {}) {
     },
   );
   return { statusCode, body: payload };
+}
+
+async function waitFor(predicate, timeoutMs = 1000, describe = () => "") {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`timed out waiting for condition ${describe()}`);
 }
 
 function captureEnvelope(timestamp) {

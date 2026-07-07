@@ -1202,6 +1202,9 @@ module.exports = function ajrmMarineLogger(app) {
 
   function startPlayback(rate) {
     if (!playback.loaded) throw new Error("Load a capture before playback");
+    if (isPlaybackAtEnd()) {
+      resetPlaybackToStart("restart from end");
+    }
     playback.rate = rate;
     playback.active = true;
     playback.paused = false;
@@ -1213,6 +1216,13 @@ module.exports = function ajrmMarineLogger(app) {
     scheduleNextPlaybackLine(0, generation);
     addEvent("playback-started", `${playback.fileName} at ${rate}x`);
     updateProviderStatus();
+  }
+
+  function isPlaybackAtEnd() {
+    return playback.loaded
+      && Number.isFinite(playback.totalLines)
+      && playback.totalLines > 0
+      && playback.cursor >= playback.totalLines;
   }
 
   function setPlaybackRate(rate) {
@@ -1242,18 +1252,24 @@ module.exports = function ajrmMarineLogger(app) {
 
   function stopPlayback(reason) {
     if (!playback.loaded && !playback.active) return;
-    clearTimeout(playback.timer);
-    playback.timer = null;
-    playback.active = false;
+    resetPlaybackToStart(reason);
     playback.paused = false;
-    playback.cursor = playback.startCursor || 0;
-    playback.current = playback.startCapturedAt || playback.from;
-    playback.previousTs = null;
-    playback.lastLineWallMs = null;
-    playback.lastReason = reason;
     playbackOperation.invalidate();
     publishPlaybackClock(false);
     updateProviderStatus();
+  }
+
+  function resetPlaybackToStart(reason) {
+    clearTimeout(playback.timer);
+    playback.timer = null;
+    playback.active = false;
+    playback.cursor = playback.startCursor || 0;
+    playback.current = playback.startCapturedAt || playback.from;
+    playback.previousTs = null;
+    playback.sourceAnchorMs = null;
+    playback.wallAnchorMs = null;
+    playback.lastLineWallMs = null;
+    playback.lastReason = reason;
   }
 
   async function seekPlayback(target) {

@@ -34,6 +34,7 @@ const elements = {
   playbackTime: document.getElementById("playbackTime"),
   playbackProgress: document.getElementById("playbackProgress"),
   seekSlider: document.getElementById("seekSlider"),
+  restartButton: document.getElementById("restartButton"),
   rewindButton: document.getElementById("rewindButton"),
   playButton: document.getElementById("playButton"),
   pauseButton: document.getElementById("pauseButton"),
@@ -96,6 +97,7 @@ elements.stopPlaybackButton.addEventListener("click", () =>
 );
 elements.playbackRate.addEventListener("change", updatePlaybackRate);
 elements.autoAdvancePlayback.addEventListener("change", updatePlaybackSettings);
+elements.restartButton.addEventListener("click", restartPlayback);
 elements.rewindButton.addEventListener("click", () => nudgePlayback(-60));
 elements.forwardButton.addEventListener("click", () => nudgePlayback(60));
 elements.extractButton.addEventListener("click", extractClip);
@@ -275,6 +277,7 @@ function renderPlayback() {
   elements.playButton.disabled = !playback.loaded || playback.active || Boolean(state.recording);
   elements.pauseButton.disabled = !playback.active;
   elements.stopPlaybackButton.disabled = !playback.loaded;
+  elements.restartButton.disabled = !playback.loaded;
   elements.rewindButton.disabled = !playback.loaded;
   elements.forwardButton.disabled = !playback.loaded;
   updateClipButtonState();
@@ -340,6 +343,16 @@ async function play() {
   await runCommand("Play recording", () =>
     post("/playback/play", {
       rate: selectedPlaybackRate(),
+    }),
+  );
+}
+
+async function restartPlayback() {
+  const playback = state && state.playback || {};
+  if (!playback.loaded) return;
+  await runCommand("Restart recording", () =>
+    post("/playback/seek", {
+      offsetSeconds: 0,
     }),
   );
 }
