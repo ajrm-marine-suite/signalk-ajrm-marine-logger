@@ -249,6 +249,61 @@ label {
   min-height: 34px;
 }
 
+.file-tabs {
+  align-items: flex-end;
+  flex-wrap: nowrap;
+  gap: 2px;
+  margin: 4px 0 10px;
+  padding: 0 4px;
+  border-bottom: 2px solid var(--accent);
+}
+
+.file-tabs .tab {
+  position: relative;
+  flex: 1 1 0;
+  min-height: 38px;
+  padding: 8px 10px 9px;
+  border: 1px solid #48647e;
+  border-bottom: 0;
+  border-radius: 8px 8px 0 0;
+  background: linear-gradient(180deg, #32485d, #23384c);
+  color: #c9d7e4;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.16),
+    0 -1px 0 rgba(255, 255, 255, 0.08);
+  transform: translateY(2px);
+}
+
+.file-tabs .tab.active {
+  padding-top: 10px;
+  border-color: var(--accent);
+  background: linear-gradient(180deg, #153844, var(--panel) 72%);
+  color: var(--text);
+  outline: 0;
+  box-shadow:
+    0 -2px 12px rgba(105, 210, 231, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  z-index: 1;
+}
+
+.file-tabs .tab.active::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: -2px;
+  left: 0;
+  height: 3px;
+  background: var(--panel);
+}
+
+.file-tabs .tab:active {
+  transform: translateY(2px);
+  filter: none;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.16),
+    0 -1px 0 rgba(255, 255, 255, 0.08);
+}
+
 .selected-file-actions {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

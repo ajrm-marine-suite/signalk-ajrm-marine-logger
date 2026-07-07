@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.19
+
+- Restyle the Log/Clip/Voyage selector as folder-style tabs, separate from the
+  normal file action buttons below it.
+
 ## 0.5.18
 
 - Mark active capture recordings with `recording.active: true` in Logger status/API output so BITE and other apps can distinguish active recording from idle metadata.
