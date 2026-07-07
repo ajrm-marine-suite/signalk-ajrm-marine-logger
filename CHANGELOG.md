@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.23
+
+- Keep the current file list visible during a playback load if a transient
+  status refresh fails, avoiding a brief misleading "Unable to load captures"
+  flash while the load job is still running.
+
 ## 0.5.22
 
 - Load recordings and voyage bundles through a pollable server-side background

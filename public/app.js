@@ -127,6 +127,11 @@ async function refresh() {
     setBanner(`Updated ${new Date(state.timestamp).toLocaleTimeString()}`);
     scheduleRefresh((state.options && state.options.statusRefreshSeconds) || 2);
   } catch (error) {
+    if (loadingPlayback && state) {
+      setBanner(`Still loading ${loadingPlayback.fileName}; Logger status refresh will retry...`);
+      scheduleRefresh(2);
+      return;
+    }
     renderOffline(error);
     setBanner(
       error.message,
