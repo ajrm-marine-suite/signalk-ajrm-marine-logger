@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.22
+
+- Load recordings and voyage bundles through a pollable server-side background
+  job from the web app, so long first-time voyage loads stay visibly loading
+  instead of timing out and needing a second Load press.
+
 ## 0.5.21
 
 - Show immediate loading feedback when a recording or voyage is loaded:

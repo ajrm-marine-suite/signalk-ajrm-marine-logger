@@ -8,6 +8,7 @@ const ACCESS_TOKEN_STORAGE_KEY = "ajrmMarineLogger.accessToken";
 const ACCESS_REQUEST_STORAGE_KEY = "ajrmMarineLogger.accessRequestHref";
 const CLIENT_ID_STORAGE_KEY = "ajrmMarineLogger.clientId";
 const REQUEST_TIMEOUT_MS = 8000;
+const PLAYBACK_LOAD_POLL_MS = 1000;
 
 const elements = {
   banner: document.getElementById("statusBanner"),
@@ -347,15 +348,40 @@ async function loadCapture(fileName, kind = activeFileTab) {
   renderPlayback();
   setBanner(`Loading ${fileName}...`);
   try {
-    await runCommand("Load recording", () => post("/playback/load", {
-      file: fileName,
-      kind,
-      includeFullBackfill: kind === "voyages" && elements.replayFullBackfill.checked,
-    }));
+    await runCommand("Load recording", async () => {
+      const result = await postNoRefresh("/playback/load", {
+        file: fileName,
+        kind,
+        async: true,
+        includeFullBackfill: kind === "voyages" && elements.replayFullBackfill.checked,
+      });
+      await waitForPlaybackLoad(result.load && result.load.id, fileName);
+    });
   } finally {
     loadingPlayback = null;
     updateSelectedFileActions();
     renderPlayback();
+  }
+}
+
+async function waitForPlaybackLoad(loadId, fileName) {
+  if (!loadId) throw new Error("Logger did not start a playback load job");
+  while (true) {
+    await sleep(PLAYBACK_LOAD_POLL_MS);
+    const status = await get(`/playback/load/status?id=${encodeURIComponent(loadId)}`);
+    const load = status.load || {};
+    if (load.state === "complete") {
+      await refresh();
+      setBanner(`Loaded ${fileName}`);
+      return load.playback;
+    }
+    if (load.state === "error") {
+      throw new Error(load.error || `Loading ${fileName} failed`);
+    }
+    if (load.state === "idle") {
+      throw new Error(`Loading ${fileName} stopped before completion`);
+    }
+    setBanner(`Loading ${fileName}...`);
   }
 }
 
@@ -540,6 +566,16 @@ async function post(path, body = {}) {
   return result;
 }
 
+async function postNoRefresh(path, body = {}) {
+  const response = await fetchWithTimeout(`${API}${path}`, {
+    method: "POST",
+    credentials: "include",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+  return readResponse(response);
+}
+
 async function readResponse(response) {
   const text = await response.text();
   const body = text ? parseJson(text) : {};
@@ -636,6 +672,10 @@ function fetchWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
       window.setTimeout(() => reject(new Error(`Timed out waiting for ${url}`)), timeoutMs);
     }),
   ]);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 async function runCommand(label, action) {

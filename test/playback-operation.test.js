@@ -541,6 +541,57 @@ test("playback play restarts from the loaded start after reaching the end", asyn
   }
 });
 
+test("playback load can run as a pollable background job", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-async-load-"));
+  const capturesDir = path.join(root, "captures");
+  await fs.mkdir(capturesDir, { recursive: true });
+  const captureName = "capture-2026-07-07T10-00-00-000Z.jsonl";
+  await fs.writeFile(
+    path.join(capturesDir, captureName),
+    `${JSON.stringify(captureEnvelope("2026-07-07T10:00:00.000Z"))}\n`,
+  );
+
+  const app = fakeApp();
+  const routes = new Map();
+  const plugin = startPlugin(app);
+  plugin.registerWithRouter(routerMap(routes));
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+    compressCompletedCaptures: false,
+  });
+
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const startResponse = await invoke(routes, "POST", "/playback/load", {
+      file: captureName,
+      kind: "logs",
+      async: true,
+    });
+
+    assert.equal(startResponse.statusCode, 200);
+    assert.equal(startResponse.body.ok, true);
+    assert.equal(startResponse.body.load.state, "loading");
+    assert.ok(startResponse.body.load.id);
+
+    await waitFor(async () => {
+      const status = await invoke(routes, "GET", "/playback/load/status", {}, {
+        id: startResponse.body.load.id,
+      });
+      return status.body.load.state === "complete";
+    });
+
+    const complete = await invoke(routes, "GET", "/playback/load/status", {}, {
+      id: startResponse.body.load.id,
+    });
+    assert.equal(complete.body.load.state, "complete");
+    assert.equal(complete.body.load.playback.loaded, true);
+    assert.equal(complete.body.load.playback.fileName, captureName);
+  } finally {
+    plugin.stop();
+  }
+});
+
 test("capture backfill ignores buffer files from before plugin start", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-old-buffer-"));
   const bufferDir = path.join(root, "buffer");
@@ -630,13 +681,13 @@ function routerMap(routes) {
   };
 }
 
-async function invoke(routes, method, route, body = {}) {
+async function invoke(routes, method, route, body = {}, query = {}) {
   let statusCode = 200;
   let payload;
   const handler = routes.get(`${method} ${route}`);
   assert.ok(handler, `expected route ${method} ${route}`);
   await handler(
-    { body },
+    { body, query },
     {
       status(code) {
         statusCode = code;

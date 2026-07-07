@@ -31,6 +31,7 @@ module.exports = function ajrmMarineLogger(app) {
   let shutdownPending = false;
   let lastPowerIntentKey = null;
   let playback = createPlaybackState();
+  let playbackLoadJob = null;
   let runStartedAtMs = Date.now();
   const playbackOperation = createPlaybackOperation();
   const recordingMetadataCache = new Map();
@@ -241,6 +242,15 @@ module.exports = function ajrmMarineLogger(app) {
       }
     });
 
+    router.get(`${prefix}/playback/load/status`, async (req, res) => {
+      const requestedId = String(req.query?.id || "");
+      if (!playbackLoadJob || (requestedId && playbackLoadJob.id !== requestedId)) {
+        res.json({ ok: true, load: { state: "idle" } });
+        return;
+      }
+      res.json({ ok: playbackLoadJob.state !== "error", load: playbackLoadJobSummary() });
+    });
+
     router.post(`${prefix}/capture/start`, write(async (req, res) => {
       try {
         if (playback.active) {
@@ -276,9 +286,15 @@ module.exports = function ajrmMarineLogger(app) {
           return;
         }
         const fileName = safeBaseName(req.body?.file);
-        const result = await loadPlayback(fileName, req.body?.kind, {
+        const playbackOptions = {
           includeFullBackfill: req.body?.includeFullBackfill === true,
-        });
+        };
+        if (req.body?.async === true) {
+          const load = startPlaybackLoadJob(fileName, req.body?.kind, playbackOptions);
+          res.json({ ok: true, load });
+          return;
+        }
+        const result = await loadPlayback(fileName, req.body?.kind, playbackOptions);
         res.json({ ok: true, playback: result });
       } catch (error) {
         res.status(400).json({ ok: false, error: error.message });
@@ -966,6 +982,51 @@ module.exports = function ajrmMarineLogger(app) {
       sourceKind: normalizedKind || recordingKindForPath(filePath),
       displayFileName: fileName,
     });
+  }
+
+  function startPlaybackLoadJob(fileName, kind, playbackOptions = {}) {
+    if (playbackLoadJob?.state === "loading") {
+      throw new Error(`Already loading ${playbackLoadJob.fileName}`);
+    }
+    playbackLoadJob = {
+      id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+      state: "loading",
+      fileName,
+      kind: normalizeRecordingKind(kind || "logs"),
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      error: null,
+      playback: null,
+    };
+    loadPlayback(fileName, kind, playbackOptions)
+      .then((result) => {
+        if (!playbackLoadJob) return;
+        playbackLoadJob.state = "complete";
+        playbackLoadJob.finishedAt = new Date().toISOString();
+        playbackLoadJob.playback = result;
+      })
+      .catch((error) => {
+        if (!playbackLoadJob) return;
+        playbackLoadJob.state = "error";
+        playbackLoadJob.finishedAt = new Date().toISOString();
+        playbackLoadJob.error = error.message || String(error);
+        logError("playback load failed", error);
+      });
+    return playbackLoadJobSummary();
+  }
+
+  function playbackLoadJobSummary() {
+    if (!playbackLoadJob) return { state: "idle" };
+    return {
+      id: playbackLoadJob.id,
+      state: playbackLoadJob.state,
+      fileName: playbackLoadJob.fileName,
+      kind: playbackLoadJob.kind,
+      startedAt: playbackLoadJob.startedAt,
+      finishedAt: playbackLoadJob.finishedAt,
+      error: playbackLoadJob.error,
+      playback: playbackLoadJob.playback,
+    };
   }
 
   async function loadPlaybackFile({
