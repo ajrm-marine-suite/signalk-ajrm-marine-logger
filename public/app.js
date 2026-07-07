@@ -57,6 +57,7 @@ let selectedFile = null;
 let selectedKind = "logs";
 let lastSelectedLogFile = null;
 let activeFileTab = "logs";
+let loadingPlayback = null;
 let refreshTimer = null;
 let draggingSeek = false;
 let savingClip = false;
@@ -232,12 +233,16 @@ function selectFile(fileName, kind = activeFileTab) {
 
 function updateSelectedFileActions() {
   const hasSelection = Boolean(selectedFile && selectedKind);
-  elements.loadSelectedButton.disabled = !hasSelection;
-  elements.deleteSelectedButton.disabled = !hasSelection;
-  elements.downloadSelectedFile.classList.toggle("disabled", !hasSelection);
-  elements.downloadSelectedFile.setAttribute("aria-disabled", String(!hasSelection));
+  const isLoading = Boolean(loadingPlayback);
+  elements.loadSelectedButton.disabled = !hasSelection || isLoading;
+  elements.loadSelectedButton.textContent = isLoading ? "Loading..." : "Load";
+  elements.deleteSelectedButton.disabled = !hasSelection || isLoading;
+  elements.downloadSelectedFile.classList.toggle("disabled", !hasSelection || isLoading);
+  elements.downloadSelectedFile.setAttribute("aria-disabled", String(!hasSelection || isLoading));
   if (hasSelection) {
-    elements.selectedFileInfo.textContent = `${selectedFile} · ${selectedKind}`;
+    elements.selectedFileInfo.textContent = isLoading && loadingPlayback.fileName === selectedFile
+      ? `Loading ${selectedFile}...`
+      : `${selectedFile} · ${selectedKind}`;
     elements.downloadSelectedFile.href = downloadUrl(selectedKind, selectedFile);
     elements.downloadSelectedFile.download = selectedFile;
   } else {
@@ -266,20 +271,25 @@ function setFileTab(tab) {
 
 function renderPlayback() {
   const playback = state.playback || {};
-  elements.loadedFile.textContent = playback.displayFileName || playback.fileName || "-";
-  elements.playbackTime.textContent = playback.current
+  const isLoading = Boolean(loadingPlayback);
+  elements.loadedFile.textContent = isLoading
+    ? loadingPlayback.fileName
+    : playback.displayFileName || playback.fileName || "-";
+  elements.playbackTime.textContent = !isLoading && playback.current
     ? new Date(playback.current).toLocaleString()
     : "-";
   const warmupText = playback.warmupActive ? " · warm-up" : "";
-  elements.playbackProgress.textContent = playback.loaded
+  elements.playbackProgress.textContent = isLoading
+    ? `Loading ${loadingPlayback.kind === "voyages" ? "voyage bundle" : "recording"}...`
+    : playback.loaded
     ? `${playback.cursor || 0} / ${playback.totalLines || 0} deltas (${playback.lastReason || "ready"}${warmupText})`
     : "No recording loaded";
-  elements.playButton.disabled = !playback.loaded || playback.active || Boolean(state.recording);
-  elements.pauseButton.disabled = !playback.active;
-  elements.stopPlaybackButton.disabled = !playback.loaded;
-  elements.restartButton.disabled = !playback.loaded;
-  elements.rewindButton.disabled = !playback.loaded;
-  elements.forwardButton.disabled = !playback.loaded;
+  elements.playButton.disabled = isLoading || !playback.loaded || playback.active || Boolean(state.recording);
+  elements.pauseButton.disabled = isLoading || !playback.active;
+  elements.stopPlaybackButton.disabled = isLoading || !playback.loaded;
+  elements.restartButton.disabled = isLoading || !playback.loaded;
+  elements.rewindButton.disabled = isLoading || !playback.loaded;
+  elements.forwardButton.disabled = isLoading || !playback.loaded;
   updateClipButtonState();
   if (document.activeElement !== elements.playbackRate) {
     elements.playbackRate.value = playback.rate === "max" ? "max" : playback.rate || 1;
@@ -332,11 +342,21 @@ async function loadCapture(fileName, kind = activeFileTab) {
   selectedFile = fileName;
   selectedKind = kind;
   if (kind === "logs") lastSelectedLogFile = fileName;
-  await runCommand("Load recording", () => post("/playback/load", {
-    file: fileName,
-    kind,
-    includeFullBackfill: kind === "voyages" && elements.replayFullBackfill.checked,
-  }));
+  loadingPlayback = { fileName, kind };
+  updateSelectedFileActions();
+  renderPlayback();
+  setBanner(`Loading ${fileName}...`);
+  try {
+    await runCommand("Load recording", () => post("/playback/load", {
+      file: fileName,
+      kind,
+      includeFullBackfill: kind === "voyages" && elements.replayFullBackfill.checked,
+    }));
+  } finally {
+    loadingPlayback = null;
+    updateSelectedFileActions();
+    renderPlayback();
+  }
 }
 
 async function play() {

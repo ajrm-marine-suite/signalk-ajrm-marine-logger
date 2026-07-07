@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.21
+
+- Show immediate loading feedback when a recording or voyage is loaded:
+  disable file action buttons, change Load to Loading, and mark the Playback
+  panel as loading until the replay is ready.
+
 ## 0.5.20
 
 - Add a playback Restart button that returns the loaded recording or voyage to
