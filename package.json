@@ -1,6 +1,6 @@
 {
   "name": "signalk-ajrm-marine-logger",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Signal K logging and replay utility for AJRM Marine Suite testing.",
   "main": "plugin/index.js",
   "scripts": {
@@ -48,6 +48,6 @@
     ]
   },
   "dependencies": {
-    "adm-zip": "^0.5.18"
+    "adm-zip": "^0.6.0"
   }
 }

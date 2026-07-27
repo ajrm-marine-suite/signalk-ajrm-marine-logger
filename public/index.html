@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AJRM Marine Logger</title>
-    <link rel="stylesheet" href="/signalk-ajrm-marine-logger/styles.css?v=0.6.0" />
+    <link rel="stylesheet" href="/signalk-ajrm-marine-logger/styles.css?v=0.6.1" />
   </head>
   <body>
     <main>
@@ -117,10 +117,26 @@
 
         <article class="panel">
           <h2>Playback</h2>
+          <label class="playback-mode-field">
+            <span>Replay mode</span>
+            <select id="playbackMode">
+              <option value="standard" selected>Standard replay</option>
+              <option value="sensor-sources">Sensor sources only (recompute)</option>
+            </select>
+          </label>
+          <label id="sensorSourcesField" class="sensor-sources-field hidden">
+            <span>Physical source prefixes</span>
+            <input id="sensorSourcePrefixes" value="YDEN" />
+            <span>Exact source IDs (optional overrides)</span>
+            <textarea id="sensorSourceIds" rows="2"></textarea>
+            <small>Logger scans the recording and resolves each prefix to an exact allow-list (for example, YDEN matches YDEN and YDEN.*). Missing and nonmatching identities are excluded; plugins.* and notifications.* are always excluded.</small>
+          </label>
           <dl class="compact">
             <div><dt>Loaded</dt><dd id="loadedFile">-</dd></div>
             <div><dt>Recording Time</dt><dd id="playbackTime">-</dd></div>
             <div><dt>Progress</dt><dd id="playbackProgress">-</dd></div>
+            <div><dt>Source policy</dt><dd id="sourcePolicyStatus">-</dd></div>
+            <div><dt>Result capture</dt><dd id="resultCaptureStatus">-</dd></div>
           </dl>
           <input id="seekSlider" type="range" min="0" max="1000" value="0" />
           <div class="transport">
@@ -188,6 +204,6 @@
         }
       }, 3000);
     </script>
-    <script src="/signalk-ajrm-marine-logger/app.js?v=0.6.0"></script>
+    <script src="/signalk-ajrm-marine-logger/app.js?v=0.6.1"></script>
   </body>
 </html>

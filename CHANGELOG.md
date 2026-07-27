@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.1
+
+- Add strict sensor-source voyage replay that filters derived, calculated, AJRM,
+  and replay output before publishing the original physical-device deltas.
+- Build the allowlist and coverage index across every recording segment before
+  replay, rather than inferring source type from path names or one segment.
+- Lock recomputation replay to real-time speed with pause, seek, and rate
+  controls disabled, isolate it from live traffic, and wait for downstream
+  calculations to flush before completion.
+- Reject normal capture-stop and playback-stop/restart API paths while a
+  recomputed result is active, and require complete pre-indexed coverage before
+  the quiet-period finalisation can begin.
+- Capture every replay sensor input and recomputed output regardless of normal
+  Logger `includePaths`, preventing narrowed live-capture settings from making
+  an apparently complete child voyage incomplete.
+- Finalise and declare every rotated recomputed-result segment in an explicit
+  manifest. Final coverage is incomplete if any declared segment is missing,
+  changed, or still unfinished.
+- Treat configured explicit physical source IDs as live-input contamination
+  matches even when that source was absent from the parent recording.
+
 ## 0.5.24
 
 - Clear the Logger playback Signal K projection when replay naturally ends or

@@ -32,8 +32,14 @@ const elements = {
   selectedFileInfo: document.getElementById("selectedFileInfo"),
   captureList: document.getElementById("captureList"),
   loadedFile: document.getElementById("loadedFile"),
+  playbackMode: document.getElementById("playbackMode"),
+  sensorSourcesField: document.getElementById("sensorSourcesField"),
+  sensorSourcePrefixes: document.getElementById("sensorSourcePrefixes"),
+  sensorSourceIds: document.getElementById("sensorSourceIds"),
   playbackTime: document.getElementById("playbackTime"),
   playbackProgress: document.getElementById("playbackProgress"),
+  sourcePolicyStatus: document.getElementById("sourcePolicyStatus"),
+  resultCaptureStatus: document.getElementById("resultCaptureStatus"),
   seekSlider: document.getElementById("seekSlider"),
   restartButton: document.getElementById("restartButton"),
   rewindButton: document.getElementById("rewindButton"),
@@ -91,6 +97,9 @@ elements.downloadSelectedFile.addEventListener("click", (event) => {
   if (elements.downloadSelectedFile.classList.contains("disabled")) event.preventDefault();
 });
 elements.playButton.addEventListener("click", play);
+elements.playbackMode.addEventListener("change", updatePlaybackMode);
+elements.sensorSourcePrefixes.addEventListener("change", updatePlaybackMode);
+elements.sensorSourceIds.addEventListener("change", updatePlaybackMode);
 elements.pauseButton.addEventListener("click", () =>
   runCommand("Pause playback", () => post("/playback/pause")),
 );
@@ -166,10 +175,11 @@ function renderCaptureStatus() {
       : 7;
   }
   elements.captureStatus.textContent = recording
-    ? `Recording ${recording.fileName} with ${recording.lines} deltas`
+    ? `${recording.kind === "recomputed-replay" ? "Recording recomputed replay" : "Recording"} ${recording.fileName} with ${recording.lines} deltas`
     : `Buffering ${(state.options && state.options.bufferMinutes) || 30} minutes in ${(state.paths && state.paths.root) || ""}`;
   elements.startCaptureButton.disabled = Boolean(recording || (state.playback && state.playback.active));
-  elements.stopCaptureButton.disabled = !recording;
+  elements.stopCaptureButton.disabled =
+    !recording || recording.kind === "recomputed-replay";
   elements.autoStartCapture.checked = state.options && state.options.autoStartCapture === true;
   elements.replayFullBackfill.checked = state.options && state.options.replayFullBackfill === true;
 }
@@ -290,16 +300,71 @@ function renderPlayback() {
     : playback.loaded
     ? `${playback.cursor || 0} / ${playback.totalLines || 0} deltas (${playback.lastReason || "ready"}${warmupText})`
     : "No recording loaded";
-  elements.playButton.disabled = isLoading || !playback.loaded || playback.active || Boolean(state.recording);
-  elements.pauseButton.disabled = isLoading || !playback.active;
-  elements.stopPlaybackButton.disabled = isLoading || !playback.loaded;
-  elements.restartButton.disabled = isLoading || !playback.loaded;
-  elements.rewindButton.disabled = isLoading || !playback.loaded;
-  elements.forwardButton.disabled = isLoading || !playback.loaded;
+  if (playback.loaded && document.activeElement !== elements.playbackMode) {
+    elements.playbackMode.value = playback.mode || "standard";
+  }
+  if (
+    playback.loaded &&
+    document.activeElement !== elements.sensorSourcePrefixes &&
+    playback.sourcePolicy &&
+    Array.isArray(playback.sourcePolicy.sensorSourcePrefixes)
+  ) {
+    elements.sensorSourcePrefixes.value = playback.sourcePolicy.sensorSourcePrefixes.join(", ");
+  }
+  if (
+    playback.loaded &&
+    document.activeElement !== elements.sensorSourceIds &&
+    playback.sourcePolicy &&
+    Array.isArray(playback.sourcePolicy.explicitSensorSourceIds)
+  ) {
+    elements.sensorSourceIds.value = playback.sourcePolicy.explicitSensorSourceIds.join(", ");
+  }
+  elements.sensorSourcesField.classList.toggle(
+    "hidden",
+    elements.playbackMode.value !== "sensor-sources",
+  );
+  const filterStats = playback.sourceFilterStats || {};
+  const sourceCatalog = playback.sourceCatalog || {};
+  const resolvedSources = playback.sourcePolicy &&
+    playback.sourcePolicy.resolvedSensorSourceIds || [];
+  const unmatchedSources = playback.sourcePolicy &&
+    playback.sourcePolicy.unmatchedExplicitSensorSourceIds || [];
+  const isolation = playback.liveInputIsolation || {};
+  elements.sourcePolicyStatus.textContent = playback.loaded
+    ? `${playback.mode === "sensor-sources" ? `Strict sensor allow-list: ${resolvedSources.join(", ") || "none resolved"}${unmatchedSources.length ? ` · NOT RECORDED: ${unmatchedSources.join(", ")}` : ""}` : "Standard"} · ${filterStats.valuesSent || 0} kept / ${filterStats.valuesExcluded || 0} excluded · recorded catalog: ${formatSourceCatalog(sourceCatalog)}${isolation.physicalUpdatesSeen ? ` · WARNING ${isolation.physicalUpdatesSeen} live physical updates detected` : ""}`
+    : "Select a mode before loading";
+  elements.resultCaptureStatus.textContent = playback.resultCapture && playback.resultCapture.active
+    ? `recording ${playback.resultCapture.fileName || ""}`
+    : "not recording";
+  const normalRecording = state.recording && state.recording.kind !== "recomputed-replay";
+  const resultCaptureActive = Boolean(
+    playback.resultCapture && playback.resultCapture.active,
+  );
+  const playbackAtEnd = playback.loaded &&
+    playback.coverage &&
+    playback.coverage.complete === true;
+  const sourcePolicyLocked = playback.active ||
+    resultCaptureActive;
+  elements.playbackMode.disabled = isLoading || sourcePolicyLocked;
+  elements.sensorSourceIds.disabled = isLoading || sourcePolicyLocked;
+  elements.sensorSourcePrefixes.disabled = isLoading || sourcePolicyLocked;
+  elements.playButton.disabled =
+    isLoading ||
+    !playback.loaded ||
+    playback.active ||
+    Boolean(normalRecording) ||
+    (resultCaptureActive && playbackAtEnd);
+  elements.pauseButton.disabled =
+    isLoading || !playback.active || resultCaptureActive;
+  elements.stopPlaybackButton.disabled = isLoading || !playback.loaded || resultCaptureActive;
+  elements.restartButton.disabled = isLoading || !playback.loaded || resultCaptureActive;
+  elements.rewindButton.disabled = isLoading || !playback.loaded || resultCaptureActive;
+  elements.forwardButton.disabled = isLoading || !playback.loaded || resultCaptureActive;
   updateClipButtonState();
   if (document.activeElement !== elements.playbackRate) {
     elements.playbackRate.value = playback.rate === "max" ? "max" : playback.rate || 1;
   }
+  elements.playbackRate.disabled = isLoading || resultCaptureActive;
   elements.autoAdvancePlayback.checked = !state.options || state.options.autoAdvancePlayback !== false;
   populateClipRangeFromSource();
   if (!draggingSeek) updateSeekSlider(playback);
@@ -359,6 +424,9 @@ async function loadCapture(fileName, kind = activeFileTab) {
         kind,
         async: true,
         includeFullBackfill: kind === "voyages" && elements.replayFullBackfill.checked,
+        mode: elements.playbackMode.value || "standard",
+        sensorSourceIds: selectedSensorSourceIds(),
+        sensorSourcePrefixes: selectedSensorSourcePrefixes(),
       });
       await waitForPlaybackLoad(result.load && result.load.id, fileName);
     });
@@ -416,6 +484,43 @@ async function updatePlaybackRate() {
       rate: selectedPlaybackRate(),
     }),
   );
+}
+
+async function updatePlaybackMode() {
+  elements.sensorSourcesField.classList.toggle(
+    "hidden",
+    elements.playbackMode.value !== "sensor-sources",
+  );
+  const playback = state && state.playback || {};
+  if (!playback.loaded) return;
+  await runCommand("Set playback source policy", () =>
+    post("/playback/mode", {
+      mode: elements.playbackMode.value || "standard",
+      sensorSourceIds: selectedSensorSourceIds(),
+      sensorSourcePrefixes: selectedSensorSourcePrefixes(),
+    }),
+  );
+}
+
+function selectedSensorSourceIds() {
+  return String(elements.sensorSourceIds.value || "")
+    .split(/[\n,]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function selectedSensorSourcePrefixes() {
+  return String(elements.sensorSourcePrefixes.value || "")
+    .split(/[\n,]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function formatSourceCatalog(catalog) {
+  const entries = Object.keys(catalog)
+    .sort()
+    .map((sourceId) => `${sourceId} (${Number(catalog[sourceId] && catalog[sourceId].values || 0)})`);
+  return entries.length ? entries.join(", ") : "none recorded";
 }
 
 function selectedPlaybackRate() {

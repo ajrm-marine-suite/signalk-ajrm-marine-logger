@@ -99,7 +99,8 @@ h2 {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -163,7 +164,8 @@ button:focus-visible,
 }
 
 input,
-select {
+select,
+textarea {
   width: 100%;
   min-height: 38px;
   border: 1px solid var(--line);
@@ -171,6 +173,20 @@ select {
   padding: 7px 9px;
   background: #091520;
   color: var(--text);
+}
+
+textarea {
+  resize: vertical;
+}
+
+.playback-mode-field,
+.sensor-sources-field {
+  margin-bottom: 10px;
+}
+
+.sensor-sources-field small {
+  color: var(--muted);
+  line-height: 1.35;
 }
 
 label {

@@ -5,6 +5,35 @@
 AJRM Marine Logger is a Signal K diagnostic capture and replay plugin intended for
 AJRM Marine testing on a Signal K vessel server.
 
+Logger now has two explicit playback modes:
+
+- **Standard replay** keeps the previous behaviour: it republishes recorded
+  non-`plugins.*`, non-`notifications.*` paths with fresh timestamps.
+- **Sensor sources only (recompute)** scans the recording's source catalogue,
+  resolves configured physical-source prefixes to an exact source allow-list,
+  and republishes only those recorded sensor updates. The default prefix
+  `YDEN` resolves both short sources such as `YDEN.2` and long sources such as
+  `YDEN.c078be001ca2785e`. Optional exact source IDs support hardware whose
+  source does not use that prefix.
+
+Exact IDs are resolved only when they actually occur in the loaded recording.
+Requested IDs that are absent remain visible as **NOT RECORDED** and are not
+silently treated as valid sensor input.
+
+The resolved exact list, configured prefix/exact rules, source catalogue,
+kept/excluded counts, original recording time, playback rate, and live-input
+isolation status are published under:
+
+```text
+vessels.self.plugins.ajrmMarineLogger.playback
+```
+
+Source selection is based only on recorded source identity
+(`update.$source`, then the documented source-label fallbacks), not path name
+or numeric value. Original source identity is retained, update and embedded
+timestamps are refreshed to wall time, and `capturedAt` /
+`originalCapturedAt` preserve the recording clock for review.
+
 Version `0.5.6` makes playback act as a live input simulator: raw input paths
 are replayed with fresh Signal K timestamps, while derived `plugins.*` and
 `notifications.*` paths are not republished into the active system.
@@ -73,7 +102,7 @@ The file browser has **Logs**, **Clips**, and **Voyages** tabs. Logs are full ca
 
 ```bash
 cd ~/.signalk
-npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.5.15 --omit=dev --no-package-lock
+npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.6.1 --omit=dev --no-package-lock
 sudo systemctl restart signalk
 ```
 
@@ -99,9 +128,43 @@ The legacy `/plugins/signalk-ajrm-marine-logger/...` route still exists for comp
 ## Behaviour
 
 - The rolling buffer is always maintained while the plugin is enabled.
-- Capture and playback are mutually exclusive, so replayed deltas are not recorded back into a capture.
+- Normal live capture and playback remain mutually exclusive. The explicit
+  recomputed-replay result capture is the sole exception.
 - Playback publishes `plugins.ajrmMarineLogger.playback` as a replay clock so AJRM Marine can show an explicit replay badge and avoid guessing from stale timestamps. The value includes whether playback is active/playing, the recording time, file name, display file name, source kind, voyage name when applicable, and rate; speed changes are published dynamically while playback is running.
 - Playback injects captured raw input deltas back into Signal K with `app.handleMessage`, using fresh replay-time update timestamps and refreshed embedded source timestamps. Derived `plugins.*` and `notifications.*` paths are recorded for forensic use but are not republished during normal playback, so current apps recompute derived state from the replayed inputs.
+- Sensor-only replay uses a strict, auditable allow-list resolved from the
+  recording before playback. Missing, unknown, and nonmatching sources are
+  excluded. The UI shows both the complete source catalogue and resolved exact
+  sensor IDs before playback.
+- A recomputed result capture uses no rolling-buffer backfill. It records each
+  filtered replay sensor input plus newly emitted live calculated/plugin
+  outputs. Normal Logger `includePaths` capture filters do not apply to this
+  result stream, so a previously narrowed live-capture configuration cannot
+  silently remove required sensor inputs or recalculated outputs. Logger
+  playback clock/self deltas are excluded to prevent recursion.
+- Recomputed result capture is locked to `1x`. Its transport cannot be
+  paused, stopped, restarted, sought, or sped up while the child recording is
+  active, preventing duplicated or timing-distorted input. Normal Stop Capture
+  is also disabled; finalisation must use Capture's **Stop and build ZIP** after
+  full coverage. Logger pre-indexes every materialised
+  voyage segment before playback, forces continuation through all of them even
+  when the ordinary auto-play-next setting is off, and carries one cumulative
+  cursor across segment boundaries. Final metadata records per-segment and
+  cumulative coverage; `coverage.complete` cannot become true after only the
+  first segment of a multi-segment voyage. Long result captures may also rotate
+  into multiple output files. Logger finalises them all and returns an explicit
+  `resultSegments` manifest; final replay coverage remains incomplete if any
+  declared result file is missing, changed, or unfinished.
+- Disable or disconnect live sensor inputs for a valid recomputation test.
+  Logger quarantines physical-source deltas that arrive outside its own replay
+  injection and records their source/count as a contamination warning, but it
+  cannot prevent those live inputs from influencing other plugins before their
+  outputs are captured. Explicitly configured physical source IDs remain part
+  of this isolation check even if they did not occur in the parent recording.
+- At replay end Logger keeps the result capture open until calculated output has
+  been quiet for three seconds. Each newly captured output restarts that quiet
+  period, with a fifteen-second maximum, so final debounced values are retained
+  without allowing a noisy calculator to block finalisation indefinitely.
 - Capture files are newline-delimited JSON, optionally gzip-compressed once complete. Each line contains the capture timestamp and the original Signal K delta.
 - Save Clip copies a named selected time range into a new JSONL file under `clips/`. Clips can be created while capture is still running, and a clip time range can span multiple hourly log files. If no individual log is selected, Save Clip searches the full log set and excludes existing clips from the source range.
 
@@ -122,6 +185,27 @@ The Signal K plugin configuration controls:
 
 The default include path is `*`, which records all delta paths. Use narrower path filters when you know exactly what you need to reduce storage use.
 
+## Recompute and capture a voyage
+
+1. Disable/disconnect live sensor feeds, restart Signal K to clear retained
+   calculator state, and leave the applications whose calculations are under
+   test enabled.
+2. Put the parent voyage ZIP in Logger's `voyages/` directory and select it in
+   the **Voyages** tab.
+3. Select **Sensor sources only (recompute)**. Leave physical-source prefix
+   `YDEN` for the recorded YDEN/NMEA inputs, or add the boat's explicit source
+   prefix/IDs.
+4. Load the voyage and verify the resolved exact source list. Stop if a required
+   GPS, depth, STW, AIS, or compass source is absent.
+5. In AJRM Marine Capture press **Start replay result**.
+6. In Logger select `1x` and press **Play**.
+7. After playback ends, press **Stop and build ZIP** in AJRM Marine Capture.
+
+The resulting portable child voyage records its parent voyage, replay mode,
+rate, source-selection policy, resolved exact sources, filter statistics,
+cursor/completeness coverage, every declared rotated result segment, and the
+live-input isolation result in `index.json`.
+
 ## Development
 
 ```bash
@@ -140,4 +224,3 @@ Development assistance: OpenAI Codex helped with code generation, refactoring, a
 This software is licensed under the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). You may use, study, share, and modify it under that licence. If you modify it and make it available to users over a network, the corresponding source code must also be made available under the AGPL.
 
 Commercial licensing is available by arrangement for organisations that want different terms.
-

@@ -9,12 +9,30 @@ const { pipeline } = require("node:stream/promises");
 const AdmZip = require("adm-zip");
 const packageInfo = require("../package.json");
 const { createPlaybackOperation } = require("./playback-operation");
+const {
+  DEFAULT_SENSOR_SOURCE_IDS,
+  DEFAULT_SENSOR_SOURCE_PREFIXES,
+  PLAYBACK_MODE_SENSOR_SOURCES,
+  createFilterStats,
+  createSourcePolicy,
+  mergeFilterStats,
+  normalizePlaybackMode,
+  normalizeSensorSourceIds,
+  normalizeSensorSourcePrefixes,
+  replayDeltaWithPolicy,
+  shouldReplayInputPath,
+  sourceCatalogFromDelta,
+  sourceIdentityForUpdate,
+  sourceMatchesPhysicalPolicy,
+} = require("./playback-source-policy");
 
 const PLAYBACK_CLOCK_PATH = "plugins.ajrmMarineLogger.playback";
 const POWER_INTENT_PATH = "plugins.ajrmMarinePiController.power.intent";
 const DEFAULT_LOG_DIRECTORY = "~/AJRMMarineLogs";
 const LEGACY_LOG_DIRECTORY = ["~/Capture", "PlusLogs"].join("");
 const RECORDING_METADATA_VERSION = 1;
+const REPLAY_CALCULATION_FLUSH_MS = 3000;
+const REPLAY_CALCULATION_FLUSH_MAX_MS = 15000;
 const AJRM_MARINE_LOGGER_API_REGISTRY = Symbol.for("mcdonaldajr.ajrmMarineLoggerApi");
 const AJRM_MARINE_CAPTURE_API_REGISTRY = Symbol.for("mcdonaldajr.ajrmMarineCaptureApi");
 const execFile = util.promisify(childProcess.execFile);
@@ -32,6 +50,7 @@ module.exports = function ajrmMarineLogger(app) {
   let lastPowerIntentKey = null;
   let playback = createPlaybackState();
   let playbackLoadJob = null;
+  let activeReplayInjection = null;
   let runStartedAtMs = Date.now();
   const playbackOperation = createPlaybackOperation();
   const recordingMetadataCache = new Map();
@@ -46,6 +65,8 @@ module.exports = function ajrmMarineLogger(app) {
     compressed: 0,
     compressionErrors: 0,
     autoAdvanced: 0,
+    replayInputsCaptured: 0,
+    replayOutputsCaptured: 0,
   };
 
   plugin.id = "signalk-ajrm-marine-logger";
@@ -156,8 +177,17 @@ module.exports = function ajrmMarineLogger(app) {
     app.signalk.on("delta", deltaListener);
     const api = {
       startCapture: ({ backfillMinutes } = {}) =>
-        startRecording(clampInt(backfillMinutes, options.backfillMinutes, 0, options.maxBackfillMinutes)),
-      stopCapture: (reason = "external stopped") => stopRecording(reason),
+        startRecording(
+          clampInt(backfillMinutes, options.backfillMinutes, 0, options.maxBackfillMinutes),
+        ),
+      startReplayResultCapture: (metadata = {}) =>
+        startReplayResultRecording(metadata),
+      stopReplayResultCapture: (reason = "recomputed replay capture stopped") =>
+        stopReplayResultRecording(reason),
+      stopCapture: (reason = "external stopped") => {
+        assertNormalCaptureCanStop();
+        return stopRecording(reason);
+      },
       status: () => buildStatus(),
       paths: () => ({ ...paths }),
     };
@@ -193,7 +223,7 @@ module.exports = function ajrmMarineLogger(app) {
     clearInterval(statusTimer);
     maintenanceTimer = null;
     statusTimer = null;
-    stopPlayback("plugin stopped");
+    stopPlayback("plugin stopped", { force: true });
     stopRecording("plugin stopped");
     closeBuffer();
     if (app.ajrmMarineLoggerApi?.paths) delete app.ajrmMarineLoggerApi;
@@ -273,9 +303,34 @@ module.exports = function ajrmMarineLogger(app) {
 
     router.post(`${prefix}/capture/stop`, write(async (_req, res) => {
       try {
+        assertNormalCaptureCanStop();
         res.json({ ok: true, recording: stopRecording("user stopped") });
       } catch (error) {
-        res.status(500).json({ ok: false, error: error.message });
+        res.status(400).json({ ok: false, error: error.message });
+      }
+    }));
+
+    router.post(`${prefix}/playback/result-capture/start`, write(async (req, res) => {
+      try {
+        res.json({
+          ok: true,
+          recording: await startReplayResultRecording(req.body || {}),
+        });
+      } catch (error) {
+        res.status(400).json({ ok: false, error: error.message });
+      }
+    }));
+
+    router.post(`${prefix}/playback/result-capture/stop`, write(async (_req, res) => {
+      try {
+        res.json({
+          ok: true,
+          recording: await stopReplayResultRecording(
+            "recomputed replay capture stopped",
+          ),
+        });
+      } catch (error) {
+        res.status(400).json({ ok: false, error: error.message });
       }
     }));
 
@@ -288,6 +343,11 @@ module.exports = function ajrmMarineLogger(app) {
         const fileName = safeBaseName(req.body?.file);
         const playbackOptions = {
           includeFullBackfill: req.body?.includeFullBackfill === true,
+          mode: normalizePlaybackMode(req.body?.mode),
+          sensorSourceIds: normalizeSensorSourceIds(req.body?.sensorSourceIds),
+          sensorSourcePrefixes: normalizeSensorSourcePrefixes(
+            req.body?.sensorSourcePrefixes,
+          ),
         };
         if (req.body?.async === true) {
           const load = startPlaybackLoadJob(fileName, req.body?.kind, playbackOptions);
@@ -311,6 +371,19 @@ module.exports = function ajrmMarineLogger(app) {
       }
     }));
 
+    router.post(`${prefix}/playback/mode`, write((req, res) => {
+      try {
+        setPlaybackMode({
+          mode: req.body?.mode,
+          sensorSourceIds: req.body?.sensorSourceIds,
+          sensorSourcePrefixes: req.body?.sensorSourcePrefixes,
+        });
+        res.json({ ok: true, playback: getPlaybackSummary() });
+      } catch (error) {
+        res.status(400).json({ ok: false, error: error.message });
+      }
+    }));
+
     router.post(`${prefix}/playback/rate`, write(async (req, res) => {
       try {
         const rate = normalizePlaybackRate(req.body?.rate, playback.rate || 1);
@@ -322,13 +395,21 @@ module.exports = function ajrmMarineLogger(app) {
     }));
 
     router.post(`${prefix}/playback/pause`, write((_req, res) => {
-      pausePlayback("paused");
-      res.json({ ok: true, playback: getPlaybackSummary() });
+      try {
+        pausePlayback("paused");
+        res.json({ ok: true, playback: getPlaybackSummary() });
+      } catch (error) {
+        res.status(400).json({ ok: false, error: error.message });
+      }
     }));
 
     router.post(`${prefix}/playback/stop`, write((_req, res) => {
-      stopPlayback("stopped");
-      res.json({ ok: true, playback: getPlaybackSummary() });
+      try {
+        stopPlayback("stopped");
+        res.json({ ok: true, playback: getPlaybackSummary() });
+      } catch (error) {
+        res.status(400).json({ ok: false, error: error.message });
+      }
     }));
 
     router.post(`${prefix}/playback/seek`, write(async (req, res) => {
@@ -567,24 +648,78 @@ module.exports = function ajrmMarineLogger(app) {
 
   function onLiveDelta(delta) {
     if (!delta || typeof delta !== "object") return;
-    if (delta.$source === plugin.id || delta.source?.label === plugin.id) return;
+    const replayInput = isActiveReplayInputDelta(delta);
+    if (
+      !replayInput &&
+      (delta.$source === plugin.id || delta.source?.label === plugin.id)
+    ) {
+      return;
+    }
     if (handlePowerIntent(delta)) return;
     if (shutdownPending) return;
-    if (playback.active || playback.paused) return;
     if (isPlaybackClockDelta(delta)) return;
+
+    const flushActive =
+      recording?.kind === "recomputed-replay" &&
+      Number.isFinite(playback.calculationFlushUntilMs) &&
+      Date.now() <= playback.calculationFlushUntilMs;
+    const resultCaptureActive =
+      recording?.kind === "recomputed-replay" &&
+      (playback.active || playback.paused || flushActive);
+    if (resultCaptureActive) {
+      if (replayInput) {
+        if (activeReplayInjection) activeReplayInjection.captured = true;
+        return;
+      }
+      const isolated = quarantinePhysicalSourceUpdates(
+        delta,
+        playback.sourcePolicy,
+      );
+      mergeLiveInputIsolation(playback.liveInputIsolation, isolated.isolation);
+      if (!isolated.delta) return;
+      const capturedAt = new Date().toISOString();
+      const envelope = {
+        capturedAt,
+        originalCapturedAt: playback.current,
+        replayRole: "recomputed-output",
+        delta: isolated.delta,
+      };
+      writeRecordingEnvelope(envelope);
+      stats.replayOutputsCaptured += 1;
+      extendCalculationFlushAfterOutput();
+      return;
+    }
 
     const filtered = filterDelta(delta);
     if (!filtered) {
       stats.filtered += 1;
       return;
     }
-
+    if (playback.active || playback.paused) return;
+    if (recording?.kind === "recomputed-replay") return;
     const capturedAt = getDeltaTimestamp(filtered) || new Date().toISOString();
     const envelope = { capturedAt, delta: filtered };
     writeBufferEnvelope(envelope);
-    if (recording && !playback.active) {
+    if (recording) {
       writeRecordingEnvelope(envelope);
     }
+  }
+
+  function isActiveReplayInputDelta(delta) {
+    if (!activeReplayInjection) return false;
+    if (activeReplayInjection.delta === delta) return true;
+    return activeReplayInjection.fingerprint === replayDeltaFingerprint(delta);
+  }
+
+  function replayDeltaFingerprint(delta) {
+    return JSON.stringify({
+      context: delta?.context || null,
+      updates: (delta?.updates || []).map((update) => ({
+        timestamp: update?.timestamp || null,
+        source: update?.$source || update?.source?.label || null,
+        paths: (update?.values || []).map((entry) => entry?.path || ""),
+      })),
+    });
   }
 
   function handlePowerIntent(delta) {
@@ -681,6 +816,7 @@ module.exports = function ajrmMarineLogger(app) {
     segment.stream.write(`${JSON.stringify(envelope)}\n`);
     segment.lines += 1;
     updateRecordingRange(segment, envelope.capturedAt);
+    syncReplayResultSegment(segment);
     stats.captured += 1;
   }
 
@@ -693,19 +829,404 @@ module.exports = function ajrmMarineLogger(app) {
     if (!Number.isFinite(toMs) || ts > toMs) segment.to = capturedAt;
   }
 
-  async function startRecording(backfillMinutes) {
+  async function startReplayResultRecording(metadata = {}) {
+    if (!playback.loaded) {
+      throw new Error("Load a voyage or recording before starting recomputed replay capture");
+    }
+    if (playback.mode !== PLAYBACK_MODE_SENSOR_SOURCES) {
+      throw new Error("Select Sensor sources only playback before starting recomputed replay capture");
+    }
+    if (playback.cursor !== playback.startCursor) {
+      throw new Error("Restart playback before starting a complete recomputed replay capture");
+    }
+    if (playback.active || playback.paused) {
+      throw new Error("Stop playback at its loaded start before starting recomputed replay capture");
+    }
+    if (playback.rate !== 1) {
+      throw new Error("Select 1x playback before starting recomputed replay capture");
+    }
+    if (recording) {
+      if (recording.kind === "recomputed-replay") return getRecordingSummary();
+      throw new Error("Stop the normal capture before starting recomputed replay capture");
+    }
+    await prepareAllReplaySegments();
+    if (!playback.sourcePolicy?.resolvedSensorSourceIds?.length) {
+      throw new Error("No recorded physical sensor source identities matched the configured policy");
+    }
+    const replayResult = {
+      schemaVersion: 1,
+      kind: "recomputed-replay",
+      parentVoyage: String(
+        metadata.parentVoyage ||
+        playback.voyageFileName ||
+        playback.displayFileName ||
+        playback.fileName ||
+        "",
+      ),
+      playbackFileName: playback.fileName,
+      displayFileName: playback.displayFileName || playback.fileName,
+      sourceKind: playback.sourceKind,
+      playbackMode: playbackModeContract(playback.mode),
+      rate: playback.rate,
+      sourcePolicy: playback.sourcePolicy,
+      originalFrom: playback.captureFrom,
+      originalTo: playback.captureTo,
+      originalVoyageStartedAt: playback.voyageStartedAt,
+      requestedBy: String(metadata.requestedBy || "ajrm-marine-logger"),
+      liveInputIsolationRequired: true,
+    };
+    playback.filterStats = createFilterStats();
+    playback.liveInputIsolation = createLiveInputIsolation();
+    resetCalculationFlush();
+    const result = await startRecording(0, {
+      kind: "recomputed-replay",
+      replayResult,
+    });
+    addEvent(
+      "replay-result-capture-started",
+      `Recording recomputed result for ${replayResult.parentVoyage || replayResult.displayFileName}`,
+    );
+    publishPlaybackClock(playback.active || playback.paused);
+    return result;
+  }
+
+  async function stopReplayResultRecording(reason) {
+    if (recording?.kind !== "recomputed-replay") {
+      throw new Error("No recomputed replay capture is active");
+    }
+    const coverage = buildPlaybackCoverage();
+    if (
+      playback.active ||
+      playback.paused ||
+      coverage.complete !== true ||
+      playback.lastReason !== "end of capture"
+    ) {
+      throw new Error(
+        "Let sensor-only playback reach the end before stopping recomputed replay capture",
+      );
+    }
+    if (!Number.isFinite(playback.calculationFlushUntilMs)) {
+      beginCalculationFlush();
+    }
+    const initialRemainingMs = calculationFlushRemainingMs();
+    if (initialRemainingMs > 0) {
+      addEvent(
+        "replay-calculation-flush",
+        `Waiting for ${Math.ceil(initialRemainingMs / 1000)} seconds of calculation quiet time`,
+      );
+      await waitForCalculationFlush();
+    }
+    const summary = await stopRecordingAndWait(reason);
+    resetCalculationFlush();
+    publishPlaybackClock(false);
+    return summary;
+  }
+
+  async function stopRecordingAndWait(reason) {
+    if (!recording) return null;
+    const segment = recording;
+    const summary = getRecordingSummary();
+    const resultCaptureSession = segment.resultCaptureSession || null;
+    recording = null;
+    let finalPath = segment.filePath;
+    let resultSegments = null;
+    if (segment.kind === "recomputed-replay" && resultCaptureSession) {
+      await trackReplayResultSegmentFinalization(
+        segment,
+        "recomputed-replay-closed",
+      );
+      await Promise.all(resultCaptureSession.finalizations);
+      resultCaptureSession.closed = true;
+      resultSegments = await validateReplayResultSegments(resultCaptureSession);
+      finalPath = segment.resultSegment?.finalPath || segment.filePath;
+    } else {
+      await endRecordingStream(segment);
+      if (options.compressCompletedCaptures) {
+        finalPath = await compressRecordingFile(segment.filePath) || segment.filePath;
+      }
+      await generateRecordingMetadata(finalPath, "capture-closed")
+        .catch((error) => logError("metadata generation failed", error));
+    }
+    const replayResult = segment.kind === "recomputed-replay"
+      ? replayResultSummary(segment, resultSegments)
+      : null;
+    const finalSummary = {
+      ...summary,
+      active: false,
+      fileName: path.basename(finalPath),
+      lines: resultSegments?.lines ?? summary.lines,
+      from: resultSegments?.from ?? summary.from,
+      to: resultSegments?.to ?? summary.to,
+      bytes: resultSegments?.bytes ?? fileSize(finalPath),
+      compressed: isCompressedLogName(finalPath),
+      replayResult,
+    };
+    addEvent("capture-stopped", `${finalSummary.fileName} stopped: ${reason}`);
+    updateProviderStatus();
+    return finalSummary;
+  }
+
+  function createReplayResultCaptureSession() {
+    return {
+      schemaVersion: 1,
+      closed: false,
+      segments: [],
+      finalizations: [],
+      errors: [],
+    };
+  }
+
+  function registerReplayResultSegment(segment, session) {
+    if (!segment || !session) return;
+    const entry = {
+      index: session.segments.length,
+      fileName: segment.fileName,
+      filePath: segment.filePath,
+      startedAt: segment.startedAt,
+      from: null,
+      to: null,
+      lines: 0,
+      bytes: 0,
+      compressed: false,
+      finalized: false,
+      available: true,
+      omitted: false,
+      error: null,
+    };
+    segment.resultCaptureSession = session;
+    segment.resultSegment = entry;
+    session.segments.push(entry);
+  }
+
+  function syncReplayResultSegment(segment) {
+    const entry = segment?.resultSegment;
+    if (!entry) return;
+    entry.fileName = path.basename(entry.finalPath || segment.filePath);
+    entry.from = segment.from || null;
+    entry.to = segment.to || null;
+    entry.lines = Number(segment.lines || 0);
+    entry.bytes = fileSize(entry.finalPath || segment.filePath);
+    entry.compressed = isCompressedLogName(entry.finalPath || segment.filePath);
+  }
+
+  function trackReplayResultSegmentFinalization(segment, reason) {
+    if (!segment?.resultCaptureSession || !segment.resultSegment) {
+      return Promise.resolve(null);
+    }
+    if (segment.resultFinalization) return segment.resultFinalization;
+    syncReplayResultSegment(segment);
+    const session = segment.resultCaptureSession;
+    const finalization = finalizeReplayResultSegment(segment, reason)
+      .catch((error) => {
+        const message = error?.message || String(error);
+        segment.resultSegment.error = message;
+        segment.resultSegment.available = false;
+        session.errors.push({
+          index: segment.resultSegment.index,
+          fileName: segment.resultSegment.fileName,
+          error: message,
+        });
+        logError("recomputed replay segment finalization failed", error);
+        return segment.resultSegment;
+      });
+    segment.resultFinalization = finalization;
+    session.finalizations.push(finalization);
+    return finalization;
+  }
+
+  async function finalizeReplayResultSegment(segment, reason) {
+    const entry = segment.resultSegment;
+    await endRecordingStream(segment);
+    syncReplayResultSegment(segment);
+    if (entry.lines <= 0 || fileSize(segment.filePath) <= 0) {
+      entry.omitted = true;
+      entry.finalized = true;
+      entry.available = true;
+      await fs.promises.unlink(segment.filePath).catch(() => {});
+      await fs.promises.unlink(recordingMetadataPath(segment.filePath)).catch(() => {});
+      return entry;
+    }
+
+    let finalPath = segment.filePath;
+    if (options.compressCompletedCaptures) {
+      try {
+        finalPath = await compressRecordingFile(segment.filePath) || segment.filePath;
+      } catch (error) {
+        logError("recomputed replay segment compression failed; retaining plain segment", error);
+      }
+    }
+    entry.finalPath = finalPath;
+    entry.filePath = finalPath;
+    entry.fileName = path.basename(finalPath);
+    entry.bytes = fileSize(finalPath);
+    entry.compressed = isCompressedLogName(finalPath);
+    entry.finalized = true;
+    entry.available = entry.bytes > 0;
+    await generateRecordingMetadata(finalPath, reason)
+      .catch((error) => logError("metadata generation failed", error));
+    return entry;
+  }
+
+  async function endRecordingStream(segment) {
+    const stream = segment?.stream;
+    if (!stream || stream.destroyed || stream.writableEnded) return;
+    await new Promise((resolve, reject) => {
+      const onError = (error) => {
+        stream.off("error", onError);
+        reject(error);
+      };
+      stream.once("error", onError);
+      stream.end(() => {
+        stream.off("error", onError);
+        resolve();
+      });
+    });
+  }
+
+  function replayResultSegmentManifestSnapshot(session) {
+    const materialized = (session?.segments || [])
+      .filter((entry) => !entry.omitted)
+      .map((entry) => ({
+        index: entry.index,
+        fileName: entry.fileName,
+        startedAt: entry.startedAt || null,
+        from: entry.from || null,
+        to: entry.to || null,
+        lines: Number(entry.lines || 0),
+        bytes: Number(entry.bytes || 0),
+        compressed: entry.compressed === true,
+        finalized: entry.finalized === true,
+        available: entry.available !== false,
+        error: entry.error || null,
+      }));
+    const fileNames = materialized.map((entry) => entry.fileName);
+    const uniqueFileNames = new Set(fileNames);
+    const complete = Boolean(
+      session?.closed === true &&
+      materialized.length > 0 &&
+      uniqueFileNames.size === materialized.length &&
+      materialized.every((entry) =>
+        entry.finalized &&
+        entry.available &&
+        entry.lines > 0 &&
+        entry.bytes > 0,
+      ),
+    );
+    return {
+      schemaVersion: 1,
+      complete,
+      segmentsTotal: materialized.length,
+      segmentsFinalized: materialized.filter((entry) => entry.finalized).length,
+      lines: materialized.reduce((total, entry) => total + entry.lines, 0),
+      bytes: materialized.reduce((total, entry) => total + entry.bytes, 0),
+      from: materialized.reduce(
+        (value, entry) => earliestIsoTimestamp(value, entry.from),
+        null,
+      ),
+      to: materialized.reduce(
+        (value, entry) => latestIsoTimestamp(value, entry.to),
+        null,
+      ),
+      errors: (session?.errors || []).map((entry) => ({ ...entry })),
+      segments: materialized,
+    };
+  }
+
+  async function validateReplayResultSegments(session) {
+    for (const entry of session?.segments || []) {
+      if (entry.omitted) continue;
+      const filePath = entry.finalPath || entry.filePath;
+      const info = await fs.promises.stat(filePath).catch(() => null);
+      const expectedBytes = Number(entry.bytes || 0);
+      entry.available = Boolean(
+        info?.isFile() &&
+        info.size > 0 &&
+        expectedBytes > 0 &&
+        info.size === expectedBytes,
+      );
+      if (!entry.available && !entry.error) {
+        entry.error = `Declared replay result segment is missing or changed: ${entry.fileName}`;
+      }
+    }
+    return replayResultSegmentManifestSnapshot(session);
+  }
+
+  function beginCalculationFlush() {
+    if (recording?.kind !== "recomputed-replay") return;
+    const now = Date.now();
+    if (!Number.isFinite(playback.calculationFlushStartedAtMs)) {
+      playback.calculationFlushStartedAtMs = now;
+      playback.calculationFlushMaxUntilMs = now + calculationFlushMaxMs();
+    }
+    playback.calculationFlushUntilMs = Math.min(
+      Number(playback.calculationFlushMaxUntilMs),
+      now + calculationFlushQuietMs(),
+    );
+  }
+
+  function extendCalculationFlushAfterOutput() {
+    if (!Number.isFinite(playback.calculationFlushStartedAtMs)) return;
+    playback.calculationFlushOutputCount += 1;
+    beginCalculationFlush();
+  }
+
+  async function waitForCalculationFlush() {
+    while (calculationFlushRemainingMs() > 0) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, calculationFlushRemainingMs()),
+      );
+    }
+  }
+
+  function calculationFlushRemainingMs() {
+    return Math.max(
+      0,
+      Number(playback.calculationFlushUntilMs || 0) - Date.now(),
+    );
+  }
+
+  function calculationFlushQuietMs() {
+    return positiveTestDuration(
+      app.ajrmMarineLoggerTestHooks?.calculationFlushQuietMs,
+      REPLAY_CALCULATION_FLUSH_MS,
+    );
+  }
+
+  function calculationFlushMaxMs() {
+    return Math.max(
+      calculationFlushQuietMs(),
+      positiveTestDuration(
+        app.ajrmMarineLoggerTestHooks?.calculationFlushMaxMs,
+        REPLAY_CALCULATION_FLUSH_MAX_MS,
+      ),
+    );
+  }
+
+  function resetCalculationFlush() {
+    playback.calculationFlushStartedAtMs = null;
+    playback.calculationFlushUntilMs = null;
+    playback.calculationFlushMaxUntilMs = null;
+    playback.calculationFlushOutputCount = 0;
+  }
+
+  async function startRecording(backfillMinutes, recordingOptions = {}) {
     if (recording) return getRecordingSummary();
     ensureDirectories();
     const startedAt = new Date();
     const fileName = `capture-${formatFileTime(startedAt)}.jsonl`;
     const filePath = path.join(paths.captures, fileName);
+    const resultCaptureSession = recordingOptions.kind === "recomputed-replay"
+      ? createReplayResultCaptureSession()
+      : null;
     const stream = fs.createWriteStream(filePath, { flags: "a" });
     recording = {
       fileName,
       filePath,
       startedAt: startedAt.toISOString(),
       startedAtMs: startedAt.getTime(),
-      backfillMinutes,
+      backfillMinutes: recordingOptions.kind === "recomputed-replay" ? 0 : backfillMinutes,
+      kind: recordingOptions.kind || "live",
+      replayResult: recordingOptions.replayResult || null,
       lines: 0,
       backfilled: 0,
       from: null,
@@ -714,9 +1235,14 @@ module.exports = function ajrmMarineLogger(app) {
       backfilling: true,
       pendingEnvelopes: [],
     };
+    if (resultCaptureSession) {
+      registerReplayResultSegment(recording, resultCaptureSession);
+    }
 
-    const cutoffMs = startedAt.getTime() - backfillMinutes * 60 * 1000;
-    recording.backfilled = await copyBufferToStream(stream, cutoffMs, recording);
+    const cutoffMs = startedAt.getTime() - recording.backfillMinutes * 60 * 1000;
+    recording.backfilled = recording.kind === "recomputed-replay"
+      ? 0
+      : await copyBufferToStream(stream, cutoffMs, recording);
     const pendingEnvelopes = recording.pendingEnvelopes;
     recording.backfilling = false;
     recording.pendingEnvelopes = [];
@@ -724,7 +1250,12 @@ module.exports = function ajrmMarineLogger(app) {
       rotateRecordingIfNeeded(new Date());
       appendRecordingEnvelope(recording, envelope);
     }
-    addEvent("capture-started", `Started ${fileName} with ${recording.backfilled} buffered deltas`);
+    addEvent(
+      "capture-started",
+      recording.kind === "recomputed-replay"
+        ? `Started ${fileName} for recomputed replay with no rolling-buffer backfill`
+        : `Started ${fileName} with ${recording.backfilled} buffered deltas`,
+    );
     updateProviderStatus();
     return getRecordingSummary();
   }
@@ -739,13 +1270,25 @@ module.exports = function ajrmMarineLogger(app) {
     return summary;
   }
 
+  function assertNormalCaptureCanStop() {
+    if (recording?.kind === "recomputed-replay") {
+      throw new Error(
+        "Use Stop and build ZIP in AJRM Marine Capture after sensor-only playback reaches the end",
+      );
+    }
+  }
+
   function rotateRecordingIfNeeded(now) {
     if (!recording) return;
     const elapsedMs = now.getTime() - recording.startedAtMs;
-    if (elapsedMs < options.captureSegmentMinutes * 60 * 1000) return;
+    if (elapsedMs < captureSegmentDurationMs()) return;
 
     const previous = recording;
-    finishRecordingStream(previous, true);
+    if (previous.kind === "recomputed-replay") {
+      trackReplayResultSegmentFinalization(previous, "capture-rotated");
+    } else {
+      finishRecordingStream(previous, true);
+    }
 
     const fileName = `capture-${formatFileTime(now)}.jsonl`;
     const filePath = path.join(paths.captures, fileName);
@@ -755,6 +1298,8 @@ module.exports = function ajrmMarineLogger(app) {
       startedAt: now.toISOString(),
       startedAtMs: now.getTime(),
       backfillMinutes: 0,
+      kind: previous.kind || "live",
+      replayResult: previous.replayResult || null,
       lines: 0,
       backfilled: 0,
       from: null,
@@ -763,8 +1308,18 @@ module.exports = function ajrmMarineLogger(app) {
       backfilling: false,
       pendingEnvelopes: [],
     };
+    if (previous.resultCaptureSession) {
+      registerReplayResultSegment(recording, previous.resultCaptureSession);
+    }
     addEvent("capture-rotated", `${previous.fileName} closed; ${fileName} started`);
     updateProviderStatus();
+  }
+
+  function captureSegmentDurationMs() {
+    return positiveTestDuration(
+      app.ajrmMarineLoggerTestHooks?.captureSegmentMs,
+      options.captureSegmentMinutes * 60 * 1000,
+    );
   }
 
   function finishRecordingStream(segment, shouldCompress) {
@@ -957,21 +1512,27 @@ module.exports = function ajrmMarineLogger(app) {
     stopPlayback("loading");
     const normalizedKind = kind ? normalizeRecordingKind(kind) : null;
     if (normalizedKind === "voyages") {
-      const firstSegment = await prepareVoyagePlayback(fileName, {
+      const preparedVoyage = await prepareVoyagePlayback(fileName, {
         includeFullBackfill:
           playbackOptions.includeFullBackfill === true || options.replayFullBackfill === true,
       });
       return loadPlaybackFile({
-        fileName: firstSegment.name,
-        filePath: firstSegment.fullPath,
-        sourceDirectory: firstSegment.directory,
+        fileName: preparedVoyage.firstSegment.name,
+        filePath: preparedVoyage.firstSegment.filePath,
+        sourceDirectory: preparedVoyage.firstSegment.directory,
         sourceKind: "voyages",
         voyageFileName: fileName,
-        displayFileName: `${fileName} / ${firstSegment.name}`,
-        initialCapturedAt: firstSegment.initialCapturedAt,
-        voyageStartedAt: firstSegment.voyageStartedAt,
-        warmupStartedAt: firstSegment.warmupStartedAt,
-        includeFullBackfill: firstSegment.includeFullBackfill,
+        displayFileName: `${fileName} / ${preparedVoyage.firstSegment.name}`,
+        initialCapturedAt: preparedVoyage.initialCapturedAt,
+        voyageStartedAt: preparedVoyage.voyageStartedAt,
+        warmupStartedAt: preparedVoyage.warmupStartedAt,
+        includeFullBackfill: preparedVoyage.includeFullBackfill,
+        mode: playbackOptions.mode,
+        sensorSourceIds: playbackOptions.sensorSourceIds,
+        sensorSourcePrefixes: playbackOptions.sensorSourcePrefixes,
+        initialSourceCatalog: preparedVoyage.sourceCatalog,
+        preparedSegments: preparedVoyage.segments,
+        preparedComplete: true,
       });
     }
     const filePath = await resolveCaptureOrClip(fileName, normalizedKind);
@@ -981,6 +1542,9 @@ module.exports = function ajrmMarineLogger(app) {
       sourceDirectory: path.dirname(filePath),
       sourceKind: normalizedKind || recordingKindForPath(filePath),
       displayFileName: fileName,
+      mode: playbackOptions.mode,
+      sensorSourceIds: playbackOptions.sensorSourceIds,
+      sensorSourcePrefixes: playbackOptions.sensorSourcePrefixes,
     });
   }
 
@@ -993,6 +1557,11 @@ module.exports = function ajrmMarineLogger(app) {
       state: "loading",
       fileName,
       kind: normalizeRecordingKind(kind || "logs"),
+      mode: normalizePlaybackMode(playbackOptions.mode),
+      sensorSourceIds: normalizeSensorSourceIds(playbackOptions.sensorSourceIds),
+      sensorSourcePrefixes: normalizeSensorSourcePrefixes(
+        playbackOptions.sensorSourcePrefixes,
+      ),
       startedAt: new Date().toISOString(),
       finishedAt: null,
       error: null,
@@ -1040,49 +1609,214 @@ module.exports = function ajrmMarineLogger(app) {
     voyageStartedAt,
     warmupStartedAt,
     includeFullBackfill = false,
+    mode,
+    sensorSourceIds,
+    sensorSourcePrefixes,
+    initialSourceCatalog,
+    preparedSegments,
+    preparedComplete = false,
   }) {
-    const playbackFilePath = isCompressedLogName(filePath)
-      ? await materializeCompressedPlaybackFile(filePath)
-      : filePath;
-    const statsInfo = await fs.promises.stat(playbackFilePath).catch(() => null);
-    const metadata = await scanFile(playbackFilePath, Infinity, true);
-    if (statsInfo?.isFile()) {
-      await writeRecordingMetadataFile(playbackFilePath, statsInfo, metadata);
-    }
+    const suppliedSegments = Array.isArray(preparedSegments)
+      ? preparedSegments
+      : [];
+    const prepared = suppliedSegments.length
+      ? suppliedSegments
+      : [await preparePlaybackSegment({
+          name: fileName,
+          filePath,
+          directory: sourceDirectory,
+        })];
+    indexPlaybackSegments(prepared);
+    const initialSegmentIndex = Math.max(
+      0,
+      prepared.findIndex((segment) =>
+        segment.filePath === filePath || segment.name === fileName),
+    );
+    const initialSegment = prepared[initialSegmentIndex];
+    const sourceCatalog = suppliedSegments.length
+      ? mergePreparedSegmentCatalogs(prepared)
+      : mergeSourceCatalog(
+          initialSourceCatalog,
+          mergePreparedSegmentCatalogs(prepared),
+        );
+    const sourcePolicy = createSourcePolicy(
+      mode,
+      { sensorSourceIds, sensorSourcePrefixes },
+      sourceCatalog,
+    );
     playback = {
       ...createPlaybackState(),
-      fileName,
-      filePath: playbackFilePath,
+      fileName: initialSegment.name,
+      filePath: initialSegment.filePath,
       sourceDirectory,
       sourceKind,
       voyageFileName: voyageFileName || null,
       displayFileName: displayFileName || fileName,
       loaded: true,
-      totalLines: metadata.lines,
-      from: metadata.from,
-      to: metadata.to,
-      current: metadata.from,
-      cursor: 0,
-      startCursor: 0,
-      startCapturedAt: metadata.from,
-      captureFrom: metadata.from,
-      captureTo: metadata.to,
+      totalLines: totalPreparedLines(prepared),
+      from: initialSegment.from,
+      to: prepared[prepared.length - 1]?.to || initialSegment.to,
+      current: initialSegment.from,
+      cursor: initialSegment.baseCursor,
+      startCursor: initialSegment.baseCursor,
+      startCapturedAt: initialSegment.from,
+      captureFrom: prepared[0]?.from || initialSegment.from,
+      captureTo: prepared[prepared.length - 1]?.to || initialSegment.to,
       voyageStartedAt: voyageStartedAt || null,
       warmupStartedAt: warmupStartedAt || null,
       includeFullBackfill: includeFullBackfill === true,
-      offsets: metadata.offsets,
-      times: metadata.times,
+      mode: sourcePolicy.mode,
+      sourcePolicy,
+      sourceCatalog,
+      filterStats: createFilterStats(),
+      offsets: initialSegment.offsets,
+      times: initialSegment.times,
+      segments: prepared,
+      segmentIndex: initialSegmentIndex,
+      segmentCursor: 0,
+      startSegmentIndex: initialSegmentIndex,
+      startSegmentCursor: 0,
+      preparedComplete: preparedComplete === true,
     };
     if (initialCapturedAt) {
       const position = findLineAtOrAfter(Date.parse(initialCapturedAt));
-      playback.cursor = position.lineIndex;
-      playback.current = position.capturedAt || metadata.from;
+      activatePlaybackSegment(position.segmentIndex, position.segmentCursor);
+      playback.cursor = position.cursor;
+      playback.current = position.capturedAt || initialSegment.from;
       playback.from = playback.current;
       playback.startCursor = playback.cursor;
       playback.startCapturedAt = playback.current;
+      playback.startSegmentIndex = position.segmentIndex;
+      playback.startSegmentCursor = position.segmentCursor;
     }
     addEvent("playback-loaded", `Loaded ${playback.displayFileName}`);
     return getPlaybackSummary();
+  }
+
+  async function preparePlaybackSegment({
+    name,
+    filePath,
+    directory,
+    metadata,
+  }) {
+    const playbackFilePath = isCompressedLogName(filePath)
+      ? await materializeCompressedPlaybackFile(filePath)
+      : filePath;
+    if (typeof app.ajrmMarineLoggerTestHooks?.beforePreparePlaybackSegment === "function") {
+      await app.ajrmMarineLoggerTestHooks.beforePreparePlaybackSegment({
+        name: name || path.basename(playbackFilePath),
+        filePath: playbackFilePath,
+      });
+    }
+    const segmentMetadata = metadata || await scanFile(
+      playbackFilePath,
+      Infinity,
+      true,
+      true,
+    );
+    const statsInfo = await fs.promises.stat(playbackFilePath).catch(() => null);
+    if (statsInfo?.isFile()) {
+      await writeRecordingMetadataFile(playbackFilePath, statsInfo, segmentMetadata);
+    }
+    return {
+      name: name || path.basename(playbackFilePath),
+      filePath: playbackFilePath,
+      directory: directory || path.dirname(playbackFilePath),
+      lines: Number(segmentMetadata.lines || 0),
+      from: segmentMetadata.from || null,
+      to: segmentMetadata.to || null,
+      offsets: Array.isArray(segmentMetadata.offsets)
+        ? segmentMetadata.offsets
+        : [],
+      times: Array.isArray(segmentMetadata.times)
+        ? segmentMetadata.times
+        : [],
+      sourceCatalog: segmentMetadata.sourceCatalog || {},
+      baseCursor: 0,
+    };
+  }
+
+  function indexPlaybackSegments(segments) {
+    let baseCursor = 0;
+    for (const segment of segments) {
+      segment.baseCursor = baseCursor;
+      baseCursor += Number(segment.lines || 0);
+    }
+    return baseCursor;
+  }
+
+  function totalPreparedLines(segments = playback.segments) {
+    if (!Array.isArray(segments) || !segments.length) return 0;
+    const last = segments[segments.length - 1];
+    return Number(last.baseCursor || 0) + Number(last.lines || 0);
+  }
+
+  function mergePreparedSegmentCatalogs(segments) {
+    let sourceCatalog = {};
+    for (const segment of segments || []) {
+      sourceCatalog = mergeSourceCatalog(sourceCatalog, segment.sourceCatalog);
+    }
+    return sourceCatalog;
+  }
+
+  function activatePlaybackSegment(segmentIndex, segmentCursor = 0) {
+    const segment = playback.segments?.[segmentIndex];
+    if (!segment) return false;
+    playback.segmentIndex = segmentIndex;
+    playback.segmentCursor = segmentCursor;
+    playback.fileName = segment.name;
+    playback.filePath = segment.filePath;
+    playback.offsets = segment.offsets;
+    playback.times = segment.times;
+    playback.current = Number.isFinite(segment.times?.[segmentCursor])
+      ? new Date(segment.times[segmentCursor]).toISOString()
+      : segment.from;
+    playback.displayFileName = playback.voyageFileName
+      ? `${playback.voyageFileName} / ${segment.name}`
+      : segment.name;
+    return true;
+  }
+
+  async function prepareAllReplaySegments() {
+    if (playback.preparedComplete) return;
+    const prepared = playback.segments || [];
+    const preparedNames = new Set(prepared.map((segment) => segment.name));
+    let current = prepared[prepared.length - 1];
+    while (current && playback.sourceDirectory) {
+      const nextFile = await nextRecordingFileAfter(
+        playback.sourceDirectory,
+        {
+          fileName: current.name,
+          to: current.to,
+          current: current.to,
+        },
+        preparedNames,
+      );
+      if (!nextFile) break;
+      const preparedSegment = await preparePlaybackSegment({
+        name: nextFile.name,
+        filePath: path.join(playback.sourceDirectory, nextFile.name),
+        directory: playback.sourceDirectory,
+      });
+      prepared.push(preparedSegment);
+      preparedNames.add(preparedSegment.name);
+      current = preparedSegment;
+    }
+    indexPlaybackSegments(prepared);
+    playback.totalLines = totalPreparedLines(prepared);
+    playback.captureFrom = prepared[0]?.from || playback.captureFrom;
+    playback.captureTo = prepared[prepared.length - 1]?.to || playback.captureTo;
+    playback.to = playback.captureTo;
+    playback.sourceCatalog = mergePreparedSegmentCatalogs(prepared);
+    playback.sourcePolicy = createSourcePolicy(
+      playback.sourcePolicy.mode,
+      {
+        sensorSourceIds: playback.sourcePolicy.explicitSensorSourceIds,
+        sensorSourcePrefixes: playback.sourcePolicy.sensorSourcePrefixes,
+      },
+      playback.sourceCatalog,
+    );
+    playback.preparedComplete = true;
   }
 
   async function materializeCompressedPlaybackFile(compressedPath) {
@@ -1148,36 +1882,44 @@ module.exports = function ajrmMarineLogger(app) {
       throw new Error(`Voyage ${fileName} does not contain any AJRM Marine Logger recording segments`);
     }
     const entries = [];
+    let sourceCatalog = {};
     for (const segment of segments) {
       const fullPath = path.join(directory, segment.name);
-      const metadata = await recordingListMetadata(fullPath, segment);
-      entries.push({
-        ...segment,
-        fullPath,
+      const preparedSegment = await preparePlaybackSegment({
+        name: segment.name,
+        filePath: fullPath,
         directory,
-        from: metadata.from,
-        to: metadata.to,
       });
+      sourceCatalog = mergeSourceCatalog(
+        sourceCatalog,
+        preparedSegment.sourceCatalog,
+      );
+      entries.push(preparedSegment);
     }
+    entries.sort((left, right) =>
+      Date.parse(left.from) - Date.parse(right.from) ||
+      left.name.localeCompare(right.name),
+    );
+    indexPlaybackSegments(entries);
     const includeFullBackfill = playbackOptions.includeFullBackfill === true;
     const warmupStartedAt = includeFullBackfill
       ? null
       : replayWarmupStart(index, options.replayWarmupMinutes);
     const targetMs = Date.parse(warmupStartedAt);
-    const first = Number.isFinite(targetMs)
+    const firstSegment = Number.isFinite(targetMs)
       ? entries.find((entry) => {
           const toMs = Date.parse(entry.to || entry.from);
           return Number.isFinite(toMs) && toMs >= targetMs;
         }) || entries[entries.length - 1]
       : entries[0];
     return {
-      name: first.name,
-      fullPath: first.fullPath,
-      directory,
+      firstSegment,
+      segments: entries,
       initialCapturedAt: includeFullBackfill ? null : warmupStartedAt,
       voyageStartedAt: index?.startedAt || null,
       warmupStartedAt,
       includeFullBackfill,
+      sourceCatalog,
     };
   }
 
@@ -1229,7 +1971,10 @@ module.exports = function ajrmMarineLogger(app) {
       const plainName = segment.name.replace(/\.gz$/i, "");
       const plainPath = path.join(directory, plainName);
       const existing = await fs.promises.stat(plainPath).catch(() => null);
-      if (existing?.isFile() && existing.size > 0) continue;
+      if (existing?.isFile() && existing.size > 0) {
+        await fs.promises.unlink(compressedPath).catch(() => {});
+        continue;
+      }
       const temporaryPath = `${plainPath}.${process.pid}.${Date.now()}.tmp`;
       await pipeline(
         fs.createReadStream(compressedPath),
@@ -1237,6 +1982,7 @@ module.exports = function ajrmMarineLogger(app) {
         fs.createWriteStream(temporaryPath),
       );
       await fs.promises.rename(temporaryPath, plainPath);
+      await fs.promises.unlink(compressedPath).catch(() => {});
     }
   }
 
@@ -1263,7 +2009,19 @@ module.exports = function ajrmMarineLogger(app) {
 
   function startPlayback(rate) {
     if (!playback.loaded) throw new Error("Load a capture before playback");
+    if (recording && recording.kind !== "recomputed-replay") {
+      throw new Error("Stop normal capture before playback");
+    }
+    if (recording?.kind === "recomputed-replay" && rate !== 1) {
+      throw new Error("Recomputed replay capture is locked to 1x playback");
+    }
+    if (recording?.kind === "recomputed-replay" && playback.active) {
+      throw new Error("Recomputed replay capture is already running and cannot be restarted");
+    }
     if (isPlaybackAtEnd()) {
+      if (recording?.kind === "recomputed-replay") {
+        throw new Error("Stop and build the completed child voyage before replaying again");
+      }
       resetPlaybackToStart("restart from end");
     }
     playback.rate = rate;
@@ -1273,9 +2031,35 @@ module.exports = function ajrmMarineLogger(app) {
     playback.sourceAnchorMs = null;
     playback.wallAnchorMs = null;
     playback.lastLineWallMs = null;
+    resetCalculationFlush();
+    if (recording?.kind === "recomputed-replay" && recording.replayResult) {
+      recording.replayResult.rate = rate;
+    }
     const generation = playbackOperation.begin();
     scheduleNextPlaybackLine(0, generation);
     addEvent("playback-started", `${playback.fileName} at ${rate}x`);
+    updateProviderStatus();
+  }
+
+  function setPlaybackMode({ mode, sensorSourceIds, sensorSourcePrefixes } = {}) {
+    if (!playback.loaded) throw new Error("Load a capture before selecting playback mode");
+    if (playback.active || recording?.kind === "recomputed-replay") {
+      throw new Error("Stop playback and recomputed replay capture before changing source policy");
+    }
+    playback.sourcePolicy = createSourcePolicy(
+      mode,
+      { sensorSourceIds, sensorSourcePrefixes },
+      playback.sourceCatalog,
+    );
+    playback.mode = playback.sourcePolicy.mode;
+    playback.filterStats = createFilterStats();
+    addEvent(
+      "playback-mode",
+      playback.mode === PLAYBACK_MODE_SENSOR_SOURCES
+        ? `Sensor-only playback: ${playback.sourcePolicy.sensorSourceIds.join(", ") || "no sources selected"}`
+        : "Standard playback selected",
+    );
+    publishPlaybackClock(playback.paused);
     updateProviderStatus();
   }
 
@@ -1288,8 +2072,14 @@ module.exports = function ajrmMarineLogger(app) {
 
   function setPlaybackRate(rate) {
     if (!playback.loaded) throw new Error("Load a capture before setting playback speed");
+    if (recording?.kind === "recomputed-replay" && rate !== 1) {
+      throw new Error("Recomputed replay capture is locked to 1x playback");
+    }
     const oldRate = playback.rate;
     playback.rate = rate;
+    if (recording?.kind === "recomputed-replay" && recording.replayResult) {
+      recording.replayResult.rate = rate;
+    }
     playback.lastReason = playback.active ? "playing" : playback.lastReason;
     publishPlaybackClock(playback.active || playback.paused);
     if (playback.active && !playback.paused) {
@@ -1301,6 +2091,9 @@ module.exports = function ajrmMarineLogger(app) {
 
   function pausePlayback(reason) {
     if (!playback.loaded) return;
+    if (recording?.kind === "recomputed-replay") {
+      throw new Error("Recomputed replay capture cannot be paused");
+    }
     playback.paused = true;
     playback.active = false;
     playback.lastReason = reason;
@@ -1323,12 +2116,19 @@ module.exports = function ajrmMarineLogger(app) {
     playbackOperation.invalidate();
     clearTimeout(playback.timer);
     playback.timer = null;
+    beginCalculationFlush();
     publishPlaybackClock(false);
     updateProviderStatus();
   }
 
-  function stopPlayback(reason) {
+  function stopPlayback(reason, { force = false } = {}) {
     if (!playback.loaded && !playback.active) return;
+    if (recording?.kind === "recomputed-replay" && !force) {
+      throw new Error(
+        "Recomputed replay capture cannot be stopped or restarted before full coverage",
+      );
+    }
+    beginCalculationFlush();
     resetPlaybackToStart(reason);
     playback.paused = false;
     playbackOperation.invalidate();
@@ -1340,6 +2140,10 @@ module.exports = function ajrmMarineLogger(app) {
     clearTimeout(playback.timer);
     playback.timer = null;
     playback.active = false;
+    activatePlaybackSegment(
+      playback.startSegmentIndex || 0,
+      playback.startSegmentCursor || 0,
+    );
     playback.cursor = playback.startCursor || 0;
     playback.current = playback.startCapturedAt || playback.from;
     playback.previousTs = null;
@@ -1351,9 +2155,13 @@ module.exports = function ajrmMarineLogger(app) {
 
   async function seekPlayback(target) {
     if (!playback.loaded) throw new Error("Load a capture before seeking");
+    if (recording?.kind === "recomputed-replay") {
+      throw new Error("Stop recomputed replay capture before seeking or restarting playback");
+    }
     const targetMs = parseSeekTarget(target);
     const position = findLineAtOrAfter(targetMs);
-    playback.cursor = position.lineIndex;
+    activatePlaybackSegment(position.segmentIndex, position.segmentCursor);
+    playback.cursor = position.cursor;
     playback.current = position.capturedAt || playback.from;
     playback.previousTs = null;
     playback.lastLineWallMs = null;
@@ -1382,7 +2190,7 @@ module.exports = function ajrmMarineLogger(app) {
 
   function reschedulePlaybackForRateChange() {
     const currentMs = playback.previousTs;
-    const nextMs = playback.times?.[playback.cursor];
+    const nextMs = nextPlaybackSourceMs();
     const lastWallMs = playback.lastLineWallMs;
     if (
       !Number.isFinite(currentMs) ||
@@ -1408,7 +2216,11 @@ module.exports = function ajrmMarineLogger(app) {
       ) {
         return;
       }
-      const entry = await readEnvelopeAtLine(playback.filePath, playback.cursor);
+      const entry = await readEnvelopeAtLine(
+        playback.filePath,
+        playback.segmentCursor,
+        playback.offsets,
+      );
       if (
         !playbackOperation.isCurrent(generation) ||
         !playback.active ||
@@ -1422,12 +2234,38 @@ module.exports = function ajrmMarineLogger(app) {
         return;
       }
 
+      playback.segmentCursor += 1;
       playback.cursor += 1;
       playback.current = entry.capturedAt;
+      playback.originalCapturedAt = entry.capturedAt;
       publishPlaybackClock(true);
-      const replayDelta = replayDeltaAsLiveInputs(entry.delta);
+      const wallTimestamp = new Date().toISOString();
+      const replayResult = replayDeltaWithPolicy(entry.delta, {
+        timestamp: wallTimestamp,
+        policy: playback.sourcePolicy,
+      });
+      mergeFilterStats(playback.filterStats, replayResult.stats);
+      const replayDelta = replayResult.delta;
       if (replayDelta) {
-        app.handleMessage(plugin.id, replayDelta);
+        if (recording?.kind === "recomputed-replay") {
+          writeRecordingEnvelope({
+            capturedAt: wallTimestamp,
+            originalCapturedAt: entry.capturedAt,
+            replayRole: "sensor-input",
+            delta: replayDelta,
+          });
+          stats.replayInputsCaptured += 1;
+        }
+        activeReplayInjection = {
+          delta: replayDelta,
+          fingerprint: replayDeltaFingerprint(replayDelta),
+          captured: false,
+        };
+        try {
+          app.handleMessage(plugin.id, replayDelta);
+        } finally {
+          activeReplayInjection = null;
+        }
       }
       stats.playbackSent += 1;
 
@@ -1443,7 +2281,7 @@ module.exports = function ajrmMarineLogger(app) {
           playback.wallAnchorMs = playback.lastLineWallMs;
         }
       }
-      nextDelayMs = playbackDelayToTimestamp(playback.times?.[playback.cursor]);
+      nextDelayMs = playbackDelayToTimestamp(nextPlaybackSourceMs());
       if (nextDelayMs > 0 || Date.now() - batchStartedMs >= 40) break;
     }
     scheduleNextPlaybackLine(nextDelayMs, generation);
@@ -1460,37 +2298,89 @@ module.exports = function ajrmMarineLogger(app) {
     });
   }
 
-  async function autoAdvancePlaybackSegment() {
-    if (!options.autoAdvancePlayback || !playback.sourceDirectory || recording) return false;
-    const nextFile = await nextRecordingFileAfter(playback.sourceDirectory, playback);
-    if (!nextFile) return false;
+  function nextPlaybackSourceMs() {
+    const currentSegment = playback.segments?.[playback.segmentIndex];
+    const currentTime = currentSegment?.times?.[playback.segmentCursor];
+    if (Number.isFinite(currentTime)) return currentTime;
+    const nextSegment = playback.segments?.[playback.segmentIndex + 1];
+    return nextSegment?.times?.[0];
+  }
 
-    const rate = playback.rate || 1;
-    await loadPlaybackFile({
-      fileName: nextFile.name,
-      filePath: path.join(playback.sourceDirectory, nextFile.name),
-      sourceDirectory: playback.sourceDirectory,
-      sourceKind: playback.sourceKind,
-      voyageFileName: playback.voyageFileName,
-      displayFileName: playback.voyageFileName
-        ? `${playback.voyageFileName} / ${nextFile.name}`
-        : nextFile.name,
-      voyageStartedAt: playback.voyageStartedAt,
-      warmupStartedAt: playback.warmupStartedAt,
-      includeFullBackfill: playback.includeFullBackfill,
-    });
-    playback.rate = rate;
+  async function autoAdvancePlaybackSegment() {
+    if (
+      (!options.autoAdvancePlayback && recording?.kind !== "recomputed-replay") ||
+      !playback.sourceDirectory ||
+      (recording && recording.kind !== "recomputed-replay")
+    ) {
+      return false;
+    }
+    let nextSegmentIndex = playback.segmentIndex + 1;
+    if (!playback.segments?.[nextSegmentIndex]) {
+      if (recording?.kind === "recomputed-replay" || playback.preparedComplete) {
+        return false;
+      }
+      const nextFile = await nextRecordingFileAfter(
+        playback.sourceDirectory,
+        playback,
+        new Set((playback.segments || []).map((segment) => segment.name)),
+      );
+      if (!nextFile) {
+        playback.preparedComplete = true;
+        return false;
+      }
+      const preparedSegment = await preparePlaybackSegment({
+        name: nextFile.name,
+        filePath: path.join(playback.sourceDirectory, nextFile.name),
+        directory: playback.sourceDirectory,
+      });
+      playback.segments.push(preparedSegment);
+      indexPlaybackSegments(playback.segments);
+      playback.totalLines = totalPreparedLines();
+      playback.captureTo = latestIsoTimestamp(
+        playback.captureTo,
+        preparedSegment.to,
+      );
+      playback.to = playback.captureTo;
+      playback.sourceCatalog = mergeSourceCatalog(
+        playback.sourceCatalog,
+        preparedSegment.sourceCatalog,
+      );
+      playback.sourcePolicy = createSourcePolicy(
+        playback.sourcePolicy.mode,
+        {
+          sensorSourceIds: playback.sourcePolicy.explicitSensorSourceIds,
+          sensorSourcePrefixes: playback.sourcePolicy.sensorSourcePrefixes,
+        },
+        playback.sourceCatalog,
+      );
+      nextSegmentIndex = playback.segments.length - 1;
+    }
+
+    const previousSourceMs = Date.parse(playback.current || "");
+    const previousWallMs = Number.isFinite(playback.lastLineWallMs)
+      ? playback.lastLineWallMs
+      : Date.now();
+    activatePlaybackSegment(nextSegmentIndex, 0);
     playback.active = true;
     playback.paused = false;
     playback.lastReason = "playing next segment";
-    playback.sourceAnchorMs = null;
-    playback.wallAnchorMs = null;
-    playback.lastLineWallMs = null;
+    playback.sourceAnchorMs = Number.isFinite(previousSourceMs)
+      ? previousSourceMs
+      : null;
+    playback.wallAnchorMs = Number.isFinite(previousSourceMs)
+      ? previousWallMs
+      : null;
+    playback.lastLineWallMs = Number.isFinite(previousSourceMs)
+      ? previousWallMs
+      : null;
     const generation = playbackOperation.begin();
     stats.autoAdvanced += 1;
-    addEvent("playback-next", `Continuing with ${nextFile.name}`);
+    addEvent("playback-next", `Continuing with ${playback.fileName}`);
     publishPlaybackClock(true);
-    scheduleNextPlaybackLine(0, generation);
+    scheduleNextPlaybackLine(
+      playbackDelayToTimestamp(nextPlaybackSourceMs()),
+      generation,
+    );
     updateProviderStatus();
     return true;
   }
@@ -1859,9 +2749,14 @@ module.exports = function ajrmMarineLogger(app) {
       generatedAt: new Date().toISOString(),
     };
     const metadataPath = recordingMetadataPath(filePath);
-    const tempPath = `${metadataPath}.tmp`;
-    await fs.promises.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`);
-    await fs.promises.rename(tempPath, metadataPath);
+    const tempPath =
+      `${filePath}.${process.pid}.${Date.now()}-${Math.random().toString(36).slice(2, 8)}.meta.json.tmp`;
+    try {
+      await fs.promises.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`);
+      await fs.promises.rename(tempPath, metadataPath);
+    } finally {
+      await fs.promises.unlink(tempPath).catch(() => {});
+    }
     const cacheKey = `${filePath}:${fileStats.size}:${fileStats.mtimeMs}`;
     recordingMetadataCache.set(cacheKey, {
       lines: payload.lines,
@@ -1871,12 +2766,14 @@ module.exports = function ajrmMarineLogger(app) {
     return payload;
   }
 
-  async function nextRecordingFileAfter(directory, current) {
+  async function nextRecordingFileAfter(directory, current, excludedNames = new Set()) {
     const files = await listRecordingFiles(directory);
     const currentEndMs = Date.parse(current.to || current.current);
     const entries = [];
     for (const file of files) {
       if (file.name === current.fileName) continue;
+      if (excludedNames.has(file.name)) continue;
+      if (file.name === recording?.fileName) continue;
       const fullPath = path.join(directory, file.name);
       const meta = await recordingListMetadata(fullPath, file);
       const fromMs = Date.parse(meta.from);
@@ -1888,7 +2785,12 @@ module.exports = function ajrmMarineLogger(app) {
     return entries[0] || null;
   }
 
-  async function scanFile(filePath, maxLines = Infinity, buildIndex = false) {
+  async function scanFile(
+    filePath,
+    maxLines = Infinity,
+    buildIndex = false,
+    buildSourceCatalog = buildIndex,
+  ) {
     const canUseOffsets = buildIndex && !isCompressedLogName(filePath);
     const meta = {
       lines: 0,
@@ -1896,6 +2798,7 @@ module.exports = function ajrmMarineLogger(app) {
       to: null,
       offsets: buildIndex ? [] : undefined,
       times: buildIndex ? [] : undefined,
+      sourceCatalog: buildSourceCatalog ? {} : undefined,
       compressed: isCompressedLogName(filePath),
     };
     await readEnvelopes(filePath, async (envelope) => {
@@ -1905,11 +2808,43 @@ module.exports = function ajrmMarineLogger(app) {
         meta.offsets.push(canUseOffsets ? envelope.__offset : null);
         meta.times.push(Date.parse(envelope.capturedAt));
       }
+      if (buildSourceCatalog) {
+        sourceCatalogFromDelta(envelope.delta, meta.sourceCatalog);
+      }
       if (meta.lines >= maxLines && maxLines !== Infinity) {
         meta.partial = true;
       }
     }, maxLines, { includeOffsets: buildIndex });
     return meta;
+  }
+
+  function mergeSourceCatalog(left = {}, right = {}) {
+    const output = {};
+    for (const catalog of [left, right]) {
+      for (const [sourceId, counts] of Object.entries(catalog || {})) {
+        const current = output[sourceId] || { updates: 0, values: 0 };
+        current.updates += Number(counts?.updates || 0);
+        current.values += Number(counts?.values || 0);
+        output[sourceId] = current;
+      }
+    }
+    return output;
+  }
+
+  function earliestIsoTimestamp(left, right) {
+    const leftMs = Date.parse(left);
+    const rightMs = Date.parse(right);
+    if (!Number.isFinite(leftMs)) return right || null;
+    if (!Number.isFinite(rightMs)) return left || null;
+    return leftMs <= rightMs ? left : right;
+  }
+
+  function latestIsoTimestamp(left, right) {
+    const leftMs = Date.parse(left);
+    const rightMs = Date.parse(right);
+    if (!Number.isFinite(leftMs)) return right || null;
+    if (!Number.isFinite(rightMs)) return left || null;
+    return leftMs >= rightMs ? left : right;
   }
 
   function updateMetadataRange(meta, capturedAt) {
@@ -1984,8 +2919,8 @@ module.exports = function ajrmMarineLogger(app) {
     };
   }
 
-  async function readEnvelopeAtLine(filePath, lineIndex) {
-    const offset = playback.offsets?.[lineIndex];
+  async function readEnvelopeAtLine(filePath, lineIndex, offsets = playback.offsets) {
+    const offset = offsets?.[lineIndex];
     if (!Number.isFinite(offset)) return readEnvelopeByScan(filePath, lineIndex);
     const line = await readLineAtOffset(filePath, offset);
     return line ? parseLogLine(line) : null;
@@ -2002,30 +2937,51 @@ module.exports = function ajrmMarineLogger(app) {
   }
 
   function findLineAtOrAfter(targetMs) {
-    const times = playback.times || [];
-    if (!times.length) {
-      return { lineIndex: 0, capturedAt: playback.from };
-    }
     if (!Number.isFinite(targetMs)) {
-      return { lineIndex: 0, capturedAt: playback.from };
+      const first = playback.segments?.[0];
+      return {
+        segmentIndex: 0,
+        segmentCursor: 0,
+        cursor: 0,
+        capturedAt: first?.from || playback.from,
+      };
     }
-    let low = 0;
-    let high = times.length - 1;
-    let best = times.length - 1;
-    while (low <= high) {
-      const mid = Math.floor((low + high) / 2);
-      if (times[mid] >= targetMs) {
-        best = mid;
-        high = mid - 1;
-      } else {
-        low = mid + 1;
+    const segments = playback.segments || [];
+    for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
+      const segment = segments[segmentIndex];
+      const times = segment.times || [];
+      if (!times.length || times[times.length - 1] < targetMs) continue;
+      let low = 0;
+      let high = times.length - 1;
+      let best = times.length - 1;
+      while (low <= high) {
+        const mid = Math.floor((low + high) / 2);
+        if (times[mid] >= targetMs) {
+          best = mid;
+          high = mid - 1;
+        } else {
+          low = mid + 1;
+        }
       }
+      return {
+        segmentIndex,
+        segmentCursor: best,
+        cursor: Number(segment.baseCursor || 0) + best,
+        capturedAt: Number.isFinite(times[best])
+          ? new Date(times[best]).toISOString()
+          : segment.from,
+      };
     }
+    const segmentIndex = Math.max(0, segments.length - 1);
+    const segment = segments[segmentIndex];
+    const segmentCursor = Math.max(0, Number(segment?.lines || 1) - 1);
     return {
-      lineIndex: best,
-      capturedAt: Number.isFinite(times[best])
-        ? new Date(times[best]).toISOString()
-        : playback.from,
+      segmentIndex,
+      segmentCursor,
+      cursor: Number(segment?.baseCursor || 0) + segmentCursor,
+      capturedAt: Number.isFinite(segment?.times?.[segmentCursor])
+        ? new Date(segment.times[segmentCursor]).toISOString()
+        : segment?.from || playback.from,
     };
   }
 
@@ -2068,6 +3024,19 @@ module.exports = function ajrmMarineLogger(app) {
       voyageStartedAt: null,
       warmupStartedAt: null,
       includeFullBackfill: false,
+      mode: "standard",
+      sourcePolicy: createSourcePolicy("standard", {
+        sensorSourceIds: DEFAULT_SENSOR_SOURCE_IDS,
+        sensorSourcePrefixes: DEFAULT_SENSOR_SOURCE_PREFIXES,
+      }),
+      sourceCatalog: {},
+      filterStats: createFilterStats(),
+      liveInputIsolation: createLiveInputIsolation(),
+      calculationFlushStartedAtMs: null,
+      calculationFlushUntilMs: null,
+      calculationFlushMaxUntilMs: null,
+      calculationFlushOutputCount: 0,
+      originalCapturedAt: null,
       rate: 1,
       previousTs: null,
       sourceAnchorMs: null,
@@ -2077,6 +3046,12 @@ module.exports = function ajrmMarineLogger(app) {
       lastReason: "not loaded",
       offsets: [],
       times: [],
+      segments: [],
+      segmentIndex: 0,
+      segmentCursor: 0,
+      startSegmentIndex: 0,
+      startSegmentCursor: 0,
+      preparedComplete: false,
     };
   }
 
@@ -2087,11 +3062,48 @@ module.exports = function ajrmMarineLogger(app) {
       fileName: recording.fileName,
       startedAt: recording.startedAt,
       backfillMinutes: recording.backfillMinutes,
+      kind: recording.kind || "live",
       backfilled: recording.backfilled,
       lines: recording.lines,
       from: recording.from,
       to: recording.to,
       bytes: fileSize(recording.filePath),
+      replayResult: recording.kind === "recomputed-replay"
+        ? replayResultSummary(recording)
+        : null,
+    };
+  }
+
+  function replayResultSummary(
+    segment,
+    resultSegments = replayResultSegmentManifestSnapshot(
+      segment?.resultCaptureSession,
+    ),
+  ) {
+    const inputCoverage = buildPlaybackCoverage();
+    const coverage = {
+      ...inputCoverage,
+      inputComplete: inputCoverage.complete === true,
+      resultSegmentsComplete: resultSegments?.complete === true,
+      complete:
+        inputCoverage.complete === true &&
+        resultSegments?.complete === true,
+    };
+    return {
+      ...segment.replayResult,
+      sourcePolicy: playback.sourcePolicy,
+      sourceCatalog: playback.sourceCatalog,
+      originalFrom: playback.captureFrom || segment.replayResult.originalFrom,
+      originalTo: playback.captureTo || segment.replayResult.originalTo,
+      originalCapturedAt: playback.originalCapturedAt,
+      sourceFilterStats: playback.filterStats,
+      liveInputIsolation: playback.liveInputIsolation,
+      resultSegments,
+      coverage,
+      calculationFlushUntil: Number.isFinite(playback.calculationFlushUntilMs)
+        ? new Date(playback.calculationFlushUntilMs).toISOString()
+        : null,
+      calculationFlush: calculationFlushSummary(),
     };
   }
 
@@ -2106,6 +3118,7 @@ module.exports = function ajrmMarineLogger(app) {
       voyageFileName: playback.voyageFileName,
       totalLines: playback.totalLines,
       cursor: playback.cursor,
+      startCursor: playback.startCursor,
       from: playback.from,
       to: playback.to,
       current: playback.current,
@@ -2116,10 +3129,111 @@ module.exports = function ajrmMarineLogger(app) {
       warmupActive: isPlaybackWarmupActive(),
       includeFullBackfill: playback.includeFullBackfill,
       replayWarmupMinutes: options.replayWarmupMinutes,
+      mode: playback.mode,
+      replayMode: playbackModeContract(playback.mode),
+      originalCapturedAt: playback.originalCapturedAt || playback.current,
+      sourcePolicy: playback.sourcePolicy,
+      sourceCatalog: playback.sourceCatalog,
+      sourceFilterStats: playback.filterStats,
+      liveInputIsolation: playback.liveInputIsolation,
+      coverage: buildPlaybackCoverage(),
+      calculationFlushUntil: Number.isFinite(playback.calculationFlushUntilMs)
+        ? new Date(playback.calculationFlushUntilMs).toISOString()
+        : null,
+      calculationFlush: calculationFlushSummary(),
+      calculationFlushActive:
+        Number.isFinite(playback.calculationFlushUntilMs) &&
+        Date.now() <= playback.calculationFlushUntilMs,
+      resultCapture: recording?.kind === "recomputed-replay"
+        ? {
+            active: true,
+            fileName: recording.fileName,
+            startedAt: recording.startedAt,
+            lines: recording.lines,
+          }
+        : { active: false },
       rate: playback.rate,
       lastReason: playback.lastReason,
       compressed: isCompressedLogName(playback.fileName || ""),
       autoAdvance: options.autoAdvancePlayback,
+    };
+  }
+
+  function buildPlaybackCoverage() {
+    const startCursor = Number(playback.startCursor || 0);
+    const cursor = Number(playback.cursor || 0);
+    const totalLines = Number(playback.totalLines || 0);
+    const segments = (playback.segments || []).map((segment, index) => {
+      const replayStartLine = index < playback.startSegmentIndex
+        ? Number(segment.lines || 0)
+        : index === playback.startSegmentIndex
+          ? Number(playback.startSegmentCursor || 0)
+          : 0;
+      let reachedLine = 0;
+      if (index < playback.segmentIndex) {
+        reachedLine = Number(segment.lines || 0);
+      } else if (index === playback.segmentIndex) {
+        reachedLine = Number(playback.segmentCursor || 0);
+      }
+      const replayableLines = Math.max(
+        0,
+        Number(segment.lines || 0) - replayStartLine,
+      );
+      const replayedLines = Math.max(
+        0,
+        Math.min(Number(segment.lines || 0), reachedLine) - replayStartLine,
+      );
+      return {
+        index,
+        fileName: segment.name,
+        from: segment.from,
+        to: segment.to,
+        lines: Number(segment.lines || 0),
+        baseCursor: Number(segment.baseCursor || 0),
+        replayStartLine,
+        replayableLines,
+        replayedLines,
+        complete: replayedLines >= replayableLines,
+        excludedBeforeReplayStart: replayableLines === 0,
+      };
+    });
+    const replaySegments = segments.filter((segment) => !segment.excludedBeforeReplayStart);
+    return {
+      complete:
+        playback.preparedComplete === true &&
+        totalLines > startCursor &&
+        cursor >= totalLines &&
+        playback.segmentIndex >= Math.max(0, playback.segments.length - 1),
+      startCursor,
+      cursor,
+      totalLines,
+      replayableLines: Math.max(0, totalLines - startCursor),
+      replayedLines: Math.max(0, cursor - startCursor),
+      segmentsTotal: replaySegments.length,
+      segmentsCompleted: replaySegments.filter((segment) => segment.complete).length,
+      loadedSegmentsTotal: segments.length,
+      preparedComplete: playback.preparedComplete === true,
+      segments,
+      lastReason: playback.lastReason,
+      originalCapturedAt:
+        playback.originalCapturedAt || playback.current || null,
+    };
+  }
+
+  function calculationFlushSummary() {
+    return {
+      quietPeriodMs: calculationFlushQuietMs(),
+      maximumDurationMs: calculationFlushMaxMs(),
+      startedAt: Number.isFinite(playback.calculationFlushStartedAtMs)
+        ? new Date(playback.calculationFlushStartedAtMs).toISOString()
+        : null,
+      quietUntil: Number.isFinite(playback.calculationFlushUntilMs)
+        ? new Date(playback.calculationFlushUntilMs).toISOString()
+        : null,
+      maximumUntil: Number.isFinite(playback.calculationFlushMaxUntilMs)
+        ? new Date(playback.calculationFlushMaxUntilMs).toISOString()
+        : null,
+      outputsDuringQuietPeriod: Number(playback.calculationFlushOutputCount || 0),
     };
   }
 
@@ -2144,6 +3258,19 @@ module.exports = function ajrmMarineLogger(app) {
                     warmupStartedAt: playback.warmupStartedAt,
                     warmupActive: isPlaybackWarmupActive(),
                     includeFullBackfill: playback.includeFullBackfill,
+                    originalCapturedAt: playback.originalCapturedAt || playback.current,
+                    mode: playback.mode,
+                    replayMode: playbackModeContract(playback.mode),
+                    sourcePolicy: playback.sourcePolicy,
+                    sourceFilterStats: playback.filterStats,
+                    liveInputIsolation: playback.liveInputIsolation,
+                    calculationFlushUntil: Number.isFinite(playback.calculationFlushUntilMs)
+                      ? new Date(playback.calculationFlushUntilMs).toISOString()
+                      : null,
+                    calculationFlushActive:
+                      Number.isFinite(playback.calculationFlushUntilMs) &&
+                      Date.now() <= playback.calculationFlushUntilMs,
+                    resultCapture: recording?.kind === "recomputed-replay",
                     playing: playback.active,
                     rate: playback.rate,
                   }
@@ -2157,6 +3284,19 @@ module.exports = function ajrmMarineLogger(app) {
                     warmupStartedAt: playback.warmupStartedAt,
                     warmupActive: false,
                     includeFullBackfill: playback.includeFullBackfill,
+                    originalCapturedAt: playback.originalCapturedAt || playback.current,
+                    mode: playback.mode,
+                    replayMode: playbackModeContract(playback.mode),
+                    sourcePolicy: playback.sourcePolicy,
+                    sourceFilterStats: playback.filterStats,
+                    liveInputIsolation: playback.liveInputIsolation,
+                    calculationFlushUntil: Number.isFinite(playback.calculationFlushUntilMs)
+                      ? new Date(playback.calculationFlushUntilMs).toISOString()
+                      : null,
+                    calculationFlushActive:
+                      Number.isFinite(playback.calculationFlushUntilMs) &&
+                      Date.now() <= playback.calculationFlushUntilMs,
+                    resultCapture: recording?.kind === "recomputed-replay",
                   },
             },
           ],
@@ -2308,81 +3448,60 @@ function getDeltaTimestamp(delta) {
 }
 
 function replayDeltaAsLiveInputs(delta, timestamp = new Date().toISOString()) {
-  if (!delta || typeof delta !== "object" || !Array.isArray(delta.updates)) return delta;
-  const updates = delta.updates
-    .map((update) => replayUpdateAsLiveInputs(update, timestamp))
-    .filter(Boolean);
-  if (!updates.length) return null;
-  return {
-    ...delta,
-    updates,
-  };
-}
-
-function replayUpdateAsLiveInputs(update, timestamp) {
-  if (!update || typeof update !== "object") return null;
-  const values = Array.isArray(update.values)
-    ? update.values
-        .filter((entry) => shouldReplayInputPath(entry?.path))
-        .map((entry) => replayEntryAsLiveInput(entry, timestamp))
-        .filter(Boolean)
-    : [];
-  if (!values.length) return null;
-  return {
-    ...update,
+  return replayDeltaWithPolicy(delta, {
     timestamp,
-    values,
-  };
+    policy: createSourcePolicy("standard", {
+      sensorSourceIds: DEFAULT_SENSOR_SOURCE_IDS,
+      sensorSourcePrefixes: DEFAULT_SENSOR_SOURCE_PREFIXES,
+    }),
+  }).delta;
 }
 
-function replayEntryAsLiveInput(entry, timestamp) {
-  const value = refreshEmbeddedSignalKTimestamp(
-    stripDerivedReplayFields(entry.value),
-    timestamp,
-  );
-  if (isEmptyReplayValue(value)) return null;
+function createLiveInputIsolation() {
   return {
-    ...entry,
-    value,
+    required: true,
+    method: "quarantine-physical-source-deltas-during-result-capture",
+    valid: true,
+    physicalUpdatesSeen: 0,
+    physicalValuesSeen: 0,
+    sources: {},
+    warning:
+      "Disable or disconnect live sensor inputs during replay. Quarantine keeps detected physical deltas out of the child log, but cannot stop them influencing live calculations before capture.",
   };
 }
 
-function shouldReplayInputPath(pathName) {
-  const pathText = String(pathName || "");
-  if (!pathText) return true;
-  if (pathText === PLAYBACK_CLOCK_PATH) return false;
-  if (pathText === "notifications" || pathText.startsWith("notifications.")) return false;
-  if (pathText === "plugins" || pathText.startsWith("plugins.")) return false;
-  return true;
-}
-
-function stripDerivedReplayFields(value) {
-  if (Array.isArray(value)) return value.map(stripDerivedReplayFields);
-  if (!value || typeof value !== "object") return value;
-  const output = {};
-  Object.entries(value).forEach(([key, child]) => {
-    if (key === "plugins" || key === "notifications") return;
-    output[key] = stripDerivedReplayFields(child);
-  });
-  return output;
-}
-
-function refreshEmbeddedSignalKTimestamp(value, timestamp) {
-  if (Array.isArray(value)) return value.map((item) => refreshEmbeddedSignalKTimestamp(item, timestamp));
-  if (!value || typeof value !== "object") return value;
-  const output = {};
-  Object.entries(value).forEach(([key, child]) => {
-    if (key === "timestamp" && typeof child === "string") {
-      output[key] = timestamp;
-    } else {
-      output[key] = refreshEmbeddedSignalKTimestamp(child, timestamp);
+function quarantinePhysicalSourceUpdates(delta, policy) {
+  const isolation = createLiveInputIsolation();
+  isolation.required = true;
+  const updates = [];
+  for (const update of delta?.updates || []) {
+    const sourceId = sourceIdentityForUpdate(delta, update);
+    if (sourceMatchesPhysicalPolicy(sourceId, policy)) {
+      const valueCount = Array.isArray(update?.values) ? update.values.length : 0;
+      isolation.physicalUpdatesSeen += 1;
+      isolation.physicalValuesSeen += valueCount;
+      isolation.sources[sourceId || "(missing)"] =
+        Number(isolation.sources[sourceId || "(missing)"] || 0) + valueCount;
+      isolation.valid = false;
+      continue;
     }
-  });
-  return output;
+    updates.push(update);
+  }
+  return {
+    delta: updates.length ? { ...delta, updates } : null,
+    isolation,
+  };
 }
 
-function isEmptyReplayValue(value) {
-  return value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0;
+function mergeLiveInputIsolation(target, addition) {
+  if (!target || !addition) return target;
+  target.physicalUpdatesSeen += Number(addition.physicalUpdatesSeen || 0);
+  target.physicalValuesSeen += Number(addition.physicalValuesSeen || 0);
+  for (const [sourceId, count] of Object.entries(addition.sources || {})) {
+    target.sources[sourceId] = Number(target.sources[sourceId] || 0) + Number(count || 0);
+  }
+  target.valid = target.physicalUpdatesSeen === 0;
+  return target;
 }
 
 function expandHome(value) {
@@ -2429,11 +3548,20 @@ function clampNumber(value, fallback, min, max) {
   return Math.min(max, Math.max(min, number));
 }
 
+function positiveTestDuration(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
 function normalizePlaybackRate(value, fallback = 1) {
   const text = String(value ?? "").trim().toLowerCase();
   if (text === "max" || text === "maximum") return "max";
   if (fallback === "max" && (value === undefined || value === null || value === "")) return "max";
   return clampNumber(value, fallback === "max" ? 1 : fallback, 0.1, 20);
+}
+
+function playbackModeContract(mode) {
+  return mode === PLAYBACK_MODE_SENSOR_SOURCES ? "sensor-only" : "standard";
 }
 
 function calculatePlaybackDelayMs({
@@ -2511,5 +3639,8 @@ module.exports._test = {
   calculatePlaybackDelayMs,
   normalizePlaybackRate,
   replayDeltaAsLiveInputs,
+  replayDeltaWithPolicy,
+  createSourcePolicy,
+  normalizeSensorSourceIds,
   shouldReplayInputPath,
 };
