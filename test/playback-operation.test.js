@@ -610,6 +610,174 @@ test("status reports one named metadata error for unchanged corrupt gzip and ret
   }
 });
 
+test("startup recovery ignores captures created after its immutable snapshot", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-startup-race-"));
+  const captures = path.join(root, "captures");
+  await fs.mkdir(captures, { recursive: true });
+  const stalePath = path.join(
+    captures,
+    "capture-2026-07-27T10-00-00-000Z.jsonl",
+  );
+  const changedPath = path.join(
+    captures,
+    "capture-2026-07-27T11-00-00-000Z.jsonl",
+  );
+  const completedPath = path.join(
+    captures,
+    "capture-2026-07-27T12-00-00-000Z.jsonl",
+  );
+  await fs.writeFile(stalePath, "");
+  await fs.writeFile(changedPath, "");
+  await fs.writeFile(
+    completedPath,
+    `${JSON.stringify(sensorEnvelope(
+      "2026-07-27T12:00:00.000Z",
+      "YDEN.2",
+    ))}\n`,
+  );
+
+  let releaseStartupRecovery;
+  const startupRecoveryGate = new Promise((resolve) => {
+    releaseStartupRecovery = resolve;
+  });
+  const app = fakeApp();
+  app.ajrmMarineLoggerTestHooks = {
+    beforeStartupRecoveryCleanup() {
+      return startupRecoveryGate;
+    },
+  };
+  const routes = new Map();
+  const plugin = startPlugin(app);
+  plugin.registerWithRouter(routerMap(routes));
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+    compressCompletedCaptures: true,
+  });
+
+  try {
+    const newName = "capture-2026-07-28T10-00-00-000Z.jsonl";
+    const newPath = path.join(captures, newName);
+    await fs.writeFile(newPath, "");
+    const changedText = `${JSON.stringify(sensorEnvelope(
+      "2026-07-27T11:00:00.000Z",
+      "YDEN.2",
+    ))}\n`;
+    await fs.writeFile(changedPath, changedText);
+    releaseStartupRecovery();
+
+    await waitFor(async () => {
+      const staleStats = await fs.stat(stalePath).catch(() => null);
+      const compressedStats = await fs.stat(`${completedPath}.gz`).catch(() => null);
+      const completedStats = await fs.stat(completedPath).catch(() => null);
+      return (
+        staleStats === null &&
+        compressedStats?.isFile() &&
+        completedStats === null
+      );
+    });
+    await assert.rejects(fs.stat(completedPath), /ENOENT/);
+    assert.equal(await fs.readFile(changedPath, "utf8"), changedText);
+    await assert.rejects(fs.stat(`${changedPath}.gz`), /ENOENT/);
+    const newEmptyStats = await fs.stat(newPath);
+    assert.equal(newEmptyStats.size, 0);
+    await assert.rejects(fs.stat(`${newPath}.gz`), /ENOENT/);
+
+    const envelope = sensorEnvelope(
+      "2026-07-28T10:00:00.000Z",
+      "YDEN.2",
+    );
+    await fs.writeFile(newPath, `${JSON.stringify(envelope)}\n`);
+    const loaded = await invoke(routes, "POST", "/playback/load", {
+      file: newName,
+      kind: "logs",
+      mode: "sensor-sources",
+      sensorSourceIds: ["YDEN.2"],
+    });
+    assert.equal(loaded.statusCode, 200);
+    assert.equal(loaded.body.ok, true);
+    assert.equal(loaded.body.playback.loaded, true);
+  } finally {
+    releaseStartupRecovery();
+    plugin.stop();
+  }
+});
+
+test("plugin stop cancels gated startup recovery before a later restart", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-recovery-stop-"));
+  const captures = path.join(root, "captures");
+  await fs.mkdir(captures, { recursive: true });
+  const emptyPath = path.join(
+    captures,
+    "capture-2026-07-27T13-00-00-000Z.jsonl",
+  );
+  const completedPath = path.join(
+    captures,
+    "capture-2026-07-27T14-00-00-000Z.jsonl",
+  );
+  const completedText = `${JSON.stringify(
+    sensorEnvelope("2026-07-27T14:00:00.000Z", "YDEN.2"),
+  )}\n`;
+  await fs.writeFile(emptyPath, "");
+  await fs.writeFile(completedPath, completedText);
+
+  let releaseStartupRecovery;
+  const startupRecoveryGate = new Promise((resolve) => {
+    releaseStartupRecovery = resolve;
+  });
+  let firstRecoveryFinished = false;
+  let firstRecoveryCancelled = false;
+  const app = fakeApp();
+  app.ajrmMarineLoggerTestHooks = {
+    beforeStartupRecoveryCleanup() {
+      return startupRecoveryGate;
+    },
+    afterStartupRecoveryCleanup({ cancelled }) {
+      firstRecoveryCancelled = cancelled;
+      firstRecoveryFinished = true;
+    },
+  };
+  const plugin = startPlugin(app);
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+    compressCompletedCaptures: true,
+  });
+
+  try {
+    plugin.stop();
+    releaseStartupRecovery();
+    await waitFor(() => firstRecoveryFinished);
+    assert.equal(firstRecoveryCancelled, true);
+    assert.equal((await fs.stat(emptyPath)).size, 0);
+    assert.equal(await fs.readFile(completedPath, "utf8"), completedText);
+    await assert.rejects(fs.stat(`${completedPath}.gz`), /ENOENT/);
+
+    let secondRecoveryFinished = false;
+    app.ajrmMarineLoggerTestHooks = {
+      afterStartupRecoveryCleanup({ cancelled }) {
+        assert.equal(cancelled, false);
+        secondRecoveryFinished = true;
+      },
+    };
+    plugin.start({
+      logDirectory: root,
+      autoStartCapture: false,
+      compressCompletedCaptures: true,
+    });
+    await waitFor(() => secondRecoveryFinished);
+    await assert.rejects(fs.stat(emptyPath), /ENOENT/);
+    await assert.rejects(fs.stat(completedPath), /ENOENT/);
+    assert.equal(
+      zlib.gunzipSync(await fs.readFile(`${completedPath}.gz`)).toString("utf8"),
+      completedText,
+    );
+  } finally {
+    releaseStartupRecovery();
+    plugin.stop();
+  }
+});
+
 test("startup compression quarantines corrupt existing gzip and preserves its plain source", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-existing-gzip-"));
   const captures = path.join(root, "captures");
@@ -646,6 +814,93 @@ test("startup compression quarantines corrupt existing gzip and preserves its pl
   }
 });
 
+test("startup compression retains a valid gzip that differs from the plain source", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-gzip-conflict-"));
+  const captures = path.join(root, "captures");
+  await fs.mkdir(captures, { recursive: true });
+  const fileName = "capture-2026-07-28T10-05-00-000Z.jsonl";
+  const plainPath = path.join(captures, fileName);
+  const gzipPath = `${plainPath}.gz`;
+  const firstLine = `${JSON.stringify(
+    sensorEnvelope("2026-07-28T10:05:00.000Z", "YDEN.2"),
+  )}\n`;
+  const plainText = `${firstLine}${JSON.stringify(
+    sensorEnvelope("2026-07-28T10:05:01.000Z", "YDEN.2"),
+  )}\n`;
+  await fs.writeFile(plainPath, plainText);
+  await fs.writeFile(gzipPath, zlib.gzipSync(firstLine));
+
+  let recoveryFinished = false;
+  const app = fakeApp();
+  app.ajrmMarineLoggerTestHooks = {
+    afterStartupRecoveryCleanup() {
+      recoveryFinished = true;
+    },
+  };
+  const plugin = startPlugin(app);
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+    compressCompletedCaptures: true,
+  });
+
+  try {
+    await waitFor(() => recoveryFinished);
+    assert.equal(await fs.readFile(plainPath, "utf8"), plainText);
+    assert.equal(
+      zlib.gunzipSync(await fs.readFile(gzipPath)).toString("utf8"),
+      firstLine,
+    );
+    const status = await app.ajrmMarineLoggerApi.status();
+    assert.equal(
+      status.recentEvents.some((event) =>
+        event.event === "capture-compression-conflict"),
+      true,
+    );
+  } finally {
+    plugin.stop();
+  }
+});
+
+test("startup compression removes a plain duplicate only when gzip content matches", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-gzip-match-"));
+  const captures = path.join(root, "captures");
+  await fs.mkdir(captures, { recursive: true });
+  const fileName = "capture-2026-07-28T10-07-00-000Z.jsonl";
+  const plainPath = path.join(captures, fileName);
+  const gzipPath = `${plainPath}.gz`;
+  const plainText = `${JSON.stringify(
+    sensorEnvelope("2026-07-28T10:07:00.000Z", "YDEN.2"),
+  )}\n`;
+  await fs.writeFile(plainPath, plainText);
+  await fs.writeFile(gzipPath, zlib.gzipSync(plainText));
+
+  let recoveryFinished = false;
+  const app = fakeApp();
+  app.ajrmMarineLoggerTestHooks = {
+    afterStartupRecoveryCleanup() {
+      recoveryFinished = true;
+    },
+  };
+  const plugin = startPlugin(app);
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+    compressCompletedCaptures: true,
+  });
+
+  try {
+    await waitFor(() => recoveryFinished);
+    await assert.rejects(fs.stat(plainPath), /ENOENT/);
+    assert.equal(
+      zlib.gunzipSync(await fs.readFile(gzipPath)).toString("utf8"),
+      plainText,
+    );
+  } finally {
+    plugin.stop();
+  }
+});
+
 test("compression validates temporary gzip before deleting the plain source", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-new-gzip-"));
   const captures = path.join(root, "captures");
@@ -657,10 +912,14 @@ test("compression validates temporary gzip before deleting the plain source", as
 
   const app = fakeApp();
   let temporaryCorrupted = false;
+  let recoveryFinished = false;
   app.ajrmMarineLoggerTestHooks = {
     async afterCompressTemporaryFile({ temporaryPath }) {
       temporaryCorrupted = true;
       await fs.writeFile(temporaryPath, Buffer.from("corrupt generated gzip"));
+    },
+    afterStartupRecoveryCleanup() {
+      recoveryFinished = true;
     },
   };
   const plugin = startPlugin(app);
@@ -671,11 +930,152 @@ test("compression validates temporary gzip before deleting the plain source", as
   });
 
   try {
-    await waitFor(() => temporaryCorrupted);
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await waitFor(() => temporaryCorrupted && recoveryFinished);
     assert.equal(await fs.readFile(plainPath, "utf8"), plainText);
     await assert.rejects(fs.stat(`${plainPath}.gz`), /ENOENT/);
     await assert.rejects(fs.stat(`${plainPath}.gz.tmp`), /ENOENT/);
+  } finally {
+    plugin.stop();
+  }
+});
+
+test("startup compression preserves a source changed while gzip is built", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-source-change-"));
+  const captures = path.join(root, "captures");
+  await fs.mkdir(captures, { recursive: true });
+  const fileName = "capture-2026-07-28T10-15-00-000Z.jsonl";
+  const plainPath = path.join(captures, fileName);
+  const originalText = `${JSON.stringify(
+    sensorEnvelope("2026-07-28T10:15:00.000Z", "YDEN.2"),
+  )}\n`;
+  const changedText = `${originalText}${JSON.stringify(
+    sensorEnvelope("2026-07-28T10:15:01.000Z", "YDEN.2"),
+  )}\n`;
+  await fs.writeFile(plainPath, originalText);
+
+  let sourceChanged = false;
+  let recoveryFinished = false;
+  const app = fakeApp();
+  app.ajrmMarineLoggerTestHooks = {
+    async afterCompressTemporaryFile({ sourcePath }) {
+      await fs.writeFile(sourcePath, changedText);
+      sourceChanged = true;
+    },
+    afterStartupRecoveryCleanup() {
+      recoveryFinished = true;
+    },
+  };
+  const plugin = startPlugin(app);
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+    compressCompletedCaptures: true,
+  });
+
+  try {
+    await waitFor(() => sourceChanged && recoveryFinished);
+    assert.equal(await fs.readFile(plainPath, "utf8"), changedText);
+    await assert.rejects(fs.stat(`${plainPath}.gz`), /ENOENT/);
+    await assert.rejects(fs.stat(`${plainPath}.gz.tmp`), /ENOENT/);
+  } finally {
+    plugin.stop();
+  }
+});
+
+test("startup recovery does not overwrite a compression temp changed after snapshot", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-temp-change-"));
+  const captures = path.join(root, "captures");
+  await fs.mkdir(captures, { recursive: true });
+  const fileName = "capture-2026-07-28T10-20-00-000Z.jsonl";
+  const plainPath = path.join(captures, fileName);
+  const temporaryPath = `${plainPath}.gz.tmp`;
+  const plainText = `${JSON.stringify(
+    sensorEnvelope("2026-07-28T10:20:00.000Z", "YDEN.2"),
+  )}\n`;
+  await fs.writeFile(plainPath, plainText);
+  await fs.writeFile(temporaryPath, "old incomplete gzip");
+
+  let releaseStartupRecovery;
+  const startupRecoveryGate = new Promise((resolve) => {
+    releaseStartupRecovery = resolve;
+  });
+  let recoveryFinished = false;
+  const app = fakeApp();
+  app.ajrmMarineLoggerTestHooks = {
+    beforeStartupRecoveryCleanup() {
+      return startupRecoveryGate;
+    },
+    afterStartupRecoveryCleanup() {
+      recoveryFinished = true;
+    },
+  };
+  const plugin = startPlugin(app);
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+    compressCompletedCaptures: true,
+  });
+
+  try {
+    const changedTemporaryText = "changed after immutable startup snapshot";
+    await fs.writeFile(temporaryPath, changedTemporaryText);
+    releaseStartupRecovery();
+    await waitFor(() => recoveryFinished);
+    assert.equal(await fs.readFile(plainPath, "utf8"), plainText);
+    assert.equal(
+      await fs.readFile(temporaryPath, "utf8"),
+      changedTemporaryText,
+    );
+    await assert.rejects(fs.stat(`${plainPath}.gz`), /ENOENT/);
+  } finally {
+    releaseStartupRecovery();
+    plugin.stop();
+  }
+});
+
+test("startup compression does not overwrite a gzip published after snapshot", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-gzip-publish-"));
+  const captures = path.join(root, "captures");
+  await fs.mkdir(captures, { recursive: true });
+  const fileName = "capture-2026-07-28T10-25-00-000Z.jsonl";
+  const plainPath = path.join(captures, fileName);
+  const gzipPath = `${plainPath}.gz`;
+  const plainText = `${JSON.stringify(
+    sensorEnvelope("2026-07-28T10:25:00.000Z", "YDEN.2"),
+  )}\n`;
+  const independentlyPublishedText = `${JSON.stringify(
+    sensorEnvelope("2026-07-28T10:24:59.000Z", "YDEN.other"),
+  )}\n`;
+  await fs.writeFile(plainPath, plainText);
+
+  let recoveryFinished = false;
+  const app = fakeApp();
+  app.ajrmMarineLoggerTestHooks = {
+    async afterCompressTemporaryFile({ compressedPath }) {
+      await fs.writeFile(
+        compressedPath,
+        zlib.gzipSync(independentlyPublishedText),
+      );
+    },
+    afterStartupRecoveryCleanup() {
+      recoveryFinished = true;
+    },
+  };
+  const plugin = startPlugin(app);
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+    compressCompletedCaptures: true,
+  });
+
+  try {
+    await waitFor(() => recoveryFinished);
+    assert.equal(await fs.readFile(plainPath, "utf8"), plainText);
+    assert.equal(
+      zlib.gunzipSync(await fs.readFile(gzipPath)).toString("utf8"),
+      independentlyPublishedText,
+    );
+    await assert.rejects(fs.stat(`${gzipPath}.tmp`), /ENOENT/);
   } finally {
     plugin.stop();
   }
@@ -980,13 +1380,13 @@ test("historical navigation datetime is replayed as current time and does not st
         sensorEnvelope(secondCapturedAt, "YDEN.2"),
       ].map((entry) => JSON.stringify(entry)).join("\n")}\n`,
     );
-    await invoke(routes, "POST", "/playback/load", {
+    await invokeOk(routes, "POST", "/playback/load", {
       file: captureName,
       kind: "logs",
       mode: "sensor-sources",
       sensorSourceIds: ["YDEN.2"],
     });
-    await invoke(routes, "POST", "/playback/result-capture/start", {
+    await invokeOk(routes, "POST", "/playback/result-capture/start", {
       parentVoyage: "voyage-historical-datetime-parent.zip",
     });
     app.ajrmMarineLoggerApi.startPlayback(1);
@@ -1062,12 +1462,12 @@ test("playback pacing remains live when the host wall clock moves backwards", as
       path.join(root, "captures", captureName),
       `${envelopes.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
     );
-    await invoke(routes, "POST", "/playback/load", {
+    await invokeOk(routes, "POST", "/playback/load", {
       file: captureName,
       kind: "logs",
       mode: "standard",
     });
-    await invoke(routes, "POST", "/playback/play", { rate: 1 });
+    await invokeOk(routes, "POST", "/playback/play", { rate: 1 });
     await waitFor(async () => {
       const status = await app.ajrmMarineLoggerApi.status();
       return status.playback.cursor === 1;
@@ -1359,7 +1759,7 @@ test("recomputed replay capture records filtered sensor input and new plugin out
     );
     assert.equal(rejectedFastPlayback.statusCode, 400);
     assert.match(rejectedFastPlayback.body.error, /locked to 1x/i);
-    await invoke(routes, "POST", "/playback/play", { rate: 1 });
+    await invokeOk(routes, "POST", "/playback/play", { rate: 1 });
     const rejectedRestart = await invoke(
       routes,
       "POST",
@@ -1488,16 +1888,16 @@ test("recomputed replay abort stops injection and preserves an explicit incomple
       path.join(root, "captures", captureName),
       `${envelopes.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
     );
-    await invoke(routes, "POST", "/playback/load", {
+    await invokeOk(routes, "POST", "/playback/load", {
       file: captureName,
       kind: "logs",
       mode: "sensor-sources",
       sensorSourceIds: ["YDEN.2"],
     });
-    await invoke(routes, "POST", "/playback/result-capture/start", {
+    await invokeOk(routes, "POST", "/playback/result-capture/start", {
       parentVoyage: "voyage-aborted-parent.zip",
     });
-    await invoke(routes, "POST", "/playback/play", { rate: 1 });
+    await invokeOk(routes, "POST", "/playback/play", { rate: 1 });
     await waitFor(async () => {
       const status = await app.ajrmMarineLoggerApi.status();
       return status.playback.cursor === 1;
@@ -1574,7 +1974,7 @@ test("recomputed playback failure remains explicit until the partial result is a
         "YDEN.2",
       ))}\n`,
     );
-    await invoke(routes, "POST", "/playback/load", {
+    await invokeOk(routes, "POST", "/playback/load", {
       file: captureName,
       kind: "logs",
       mode: "sensor-sources",
@@ -1584,7 +1984,7 @@ test("recomputed playback failure remains explicit until the partial result is a
       const status = await app.ajrmMarineLoggerApi.status();
       return status.playback.loaded === true;
     }, 5000);
-    await invoke(routes, "POST", "/playback/result-capture/start", {
+    await invokeOk(routes, "POST", "/playback/result-capture/start", {
       parentVoyage: "voyage-failed-parent.zip",
     });
     await fs.unlink(capturePath).catch((error) => {
@@ -1727,7 +2127,7 @@ test("recomputed voyage replay pre-indexes every segment and reports cumulative 
     assert.equal(started.body.recording.replayResult.coverage.segmentsTotal, 2);
     assert.equal(prepared.length, 2, "result start must reuse the pre-indexed voyage");
 
-    await invoke(routes, "POST", "/playback/play", { rate: 1 });
+    await invokeOk(routes, "POST", "/playback/play", { rate: 1 });
     let betweenSegments = null;
     await waitFor(async () => {
       const status = await app.ajrmMarineLoggerApi.status();
@@ -1809,16 +2209,16 @@ test("forced-short rotation declares every finalized recomputed result segment",
       path.join(root, "captures", captureName),
       `${envelopes.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
     );
-    await invoke(routes, "POST", "/playback/load", {
+    await invokeOk(routes, "POST", "/playback/load", {
       file: captureName,
       kind: "logs",
       mode: "sensor-sources",
       sensorSourceIds: ["YDEN.2"],
     });
-    await invoke(routes, "POST", "/playback/result-capture/start", {
+    await invokeOk(routes, "POST", "/playback/result-capture/start", {
       parentVoyage: "voyage-rotation-parent.zip",
     });
-    await invoke(routes, "POST", "/playback/play", { rate: 1 });
+    await invokeOk(routes, "POST", "/playback/play", { rate: 1 });
     await waitFor(async () => {
       const status = await app.ajrmMarineLoggerApi.status();
       return status.playback.lastReason === "end of capture";
@@ -1878,16 +2278,16 @@ test("rotated recomputed result manifest makes coverage incomplete when an earli
       path.join(root, "captures", captureName),
       `${envelopes.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
     );
-    await invoke(routes, "POST", "/playback/load", {
+    await invokeOk(routes, "POST", "/playback/load", {
       file: captureName,
       kind: "logs",
       mode: "sensor-sources",
       sensorSourceIds: ["YDEN.2"],
     });
-    await invoke(routes, "POST", "/playback/result-capture/start", {
+    await invokeOk(routes, "POST", "/playback/result-capture/start", {
       parentVoyage: "voyage-rotation-parent.zip",
     });
-    await invoke(routes, "POST", "/playback/play", { rate: 1 });
+    await invokeOk(routes, "POST", "/playback/play", { rate: 1 });
 
     let activeManifest = null;
     await waitFor(async () => {
@@ -1962,16 +2362,16 @@ test("recomputed result manifest rejects a same-size unreadable gzip segment", a
       path.join(root, "captures", captureName),
       `${envelopes.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
     );
-    await invoke(routes, "POST", "/playback/load", {
+    await invokeOk(routes, "POST", "/playback/load", {
       file: captureName,
       kind: "logs",
       mode: "sensor-sources",
       sensorSourceIds: ["YDEN.2"],
     });
-    await invoke(routes, "POST", "/playback/result-capture/start", {
+    await invokeOk(routes, "POST", "/playback/result-capture/start", {
       parentVoyage: "voyage-corrupt-result-parent.zip",
     });
-    await invoke(routes, "POST", "/playback/play", { rate: 1 });
+    await invokeOk(routes, "POST", "/playback/play", { rate: 1 });
 
     let activeManifest = null;
     await waitFor(async () => {
@@ -2069,16 +2469,16 @@ test("recomputed replay flush extends for output quiet time but stops at its max
         "YDEN.2",
       ))}\n`,
     );
-    await invoke(routes, "POST", "/playback/load", {
+    await invokeOk(routes, "POST", "/playback/load", {
       file: captureName,
       kind: "logs",
       mode: "sensor-sources",
       sensorSourceIds: ["YDEN.2"],
     });
-    await invoke(routes, "POST", "/playback/result-capture/start", {
+    await invokeOk(routes, "POST", "/playback/result-capture/start", {
       parentVoyage: "voyage-flush-parent.zip",
     });
-    await invoke(routes, "POST", "/playback/play", { rate: 1 });
+    await invokeOk(routes, "POST", "/playback/play", { rate: 1 });
     await waitFor(async () => {
       const status = await app.ajrmMarineLoggerApi.status();
       return status.playback.lastReason === "end of capture";
@@ -2169,6 +2569,21 @@ async function invoke(routes, method, route, body = {}, query = {}) {
     },
   );
   return { statusCode, body: payload };
+}
+
+async function invokeOk(routes, method, route, body = {}, query = {}) {
+  const response = await invoke(routes, method, route, body, query);
+  assert.equal(
+    response.statusCode,
+    200,
+    `${method} ${route} failed: ${JSON.stringify(response.body)}`,
+  );
+  assert.equal(
+    response.body?.ok,
+    true,
+    `${method} ${route} did not return ok: ${JSON.stringify(response.body)}`,
+  );
+  return response;
 }
 
 async function waitFor(predicate, timeoutMs = 1000, describe = () => "") {

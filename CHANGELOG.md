@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.3
+
+- Restrict startup cleanup and compression to an immutable snapshot of files
+  that existed before Logger exposed its controls. Recheck each candidate's
+  identity, size, and timestamps before mutation so a newly created or changed
+  capture cannot be removed as stale.
+- Serialize startup recovery across restarts and invalidate it on plugin stop.
+  Publish new gzip files exclusively, compare existing gzip content with its
+  plain source before removing either, and preserve both when they differ.
+- Use an explicit test entry point that runs on Node.js 20/32-bit ARM as well
+  as the supported Windows, macOS, Linux, and ARM64 environments.
+
 ## 0.6.2
 
 - Report the exact capture or clip whose metadata scan failed, retain that

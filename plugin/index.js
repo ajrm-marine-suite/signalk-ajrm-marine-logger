@@ -1,5 +1,6 @@
 const fs = require("node:fs");
 const childProcess = require("node:child_process");
+const crypto = require("node:crypto");
 const os = require("node:os");
 const path = require("node:path");
 const { performance } = require("node:perf_hooks");
@@ -54,6 +55,8 @@ module.exports = function ajrmMarineLogger(app) {
   let playbackLoadJob = null;
   let activeReplayInjection = null;
   let runStartedAtMs = Date.now();
+  let startupRecoveryGeneration = 0;
+  let startupRecoveryPromise = Promise.resolve();
   const playbackOperation = createPlaybackOperation();
   const recordingMetadataCache = new Map();
   const recordingMetadataFailures = new Map();
@@ -171,11 +174,18 @@ module.exports = function ajrmMarineLogger(app) {
     options = normalizeOptions(pluginOptions);
     paths = buildPaths(options.logDirectory);
     ensureDirectories();
+    const recoveryGeneration = startupRecoveryGeneration + 1;
+    startupRecoveryGeneration = recoveryGeneration;
+    const startupRecoverySnapshot = snapshotStartupRecoveryFiles();
     options = { ...options, ...readSavedSettings() };
     clearStartupBufferFiles();
     rotateBuffer(new Date());
     pruneBuffer();
-    recoverStaleCaptureFiles();
+    startupRecoveryPromise = recoverStaleCaptureFiles(
+      startupRecoverySnapshot,
+      recoveryGeneration,
+      startupRecoveryPromise,
+    );
     deltaListener = (delta) => onLiveDelta(delta);
     app.signalk.on("delta", deltaListener);
     const api = {
@@ -224,6 +234,7 @@ module.exports = function ajrmMarineLogger(app) {
   };
 
   plugin.stop = () => {
+    startupRecoveryGeneration += 1;
     if (deltaListener) {
       app.signalk.removeListener("delta", deltaListener);
       deltaListener = null;
@@ -1447,34 +1458,121 @@ module.exports = function ajrmMarineLogger(app) {
     });
   }
 
-  async function compressRecordingFile(filePath) {
+  async function compressRecordingFile(filePath, recoveryCandidate = null) {
     if (!filePath.endsWith(".jsonl")) return null;
+    if (!startupRecoveryCandidateIsCurrent(recoveryCandidate)) return null;
+    if (recoveryCandidate && recording?.filePath === filePath) return null;
     const compressedPath = `${filePath}.gz`;
     const statsInfo = await fs.promises.stat(filePath).catch(() => null);
     if (!statsInfo?.isFile() || statsInfo.size === 0) return null;
-    if (await fileExists(compressedPath)) {
+    if (
+      recoveryCandidate &&
+      !startupRecoveryFileMatches(statsInfo, recoveryCandidate.source)
+    ) {
+      return null;
+    }
+    const compressedStats = await fs.promises.stat(compressedPath).catch(() => null);
+    if (
+      recoveryCandidate?.compressed &&
+      !compressedStats?.isFile()
+    ) {
+      return null;
+    }
+    if (compressedStats?.isFile()) {
+      if (
+        recoveryCandidate &&
+        (
+          !recoveryCandidate.compressed ||
+          !startupRecoveryFileMatches(
+            compressedStats,
+            recoveryCandidate.compressed,
+          )
+        )
+      ) {
+        return null;
+      }
       try {
         await validateGzipReadable(compressedPath);
       } catch (error) {
-        const quarantinedPath = await quarantineInvalidCompressedFile(compressedPath);
+        if (
+          recoveryCandidate &&
+          (
+            !startupRecoveryCandidateIsCurrent(recoveryCandidate) ||
+            recording?.filePath === filePath ||
+            !await startupRecoveryCandidateStillMatches(
+              filePath,
+              recoveryCandidate.source,
+              recoveryCandidate.recoveryGeneration,
+            ) ||
+            !await startupRecoveryCandidateStillMatches(
+              compressedPath,
+              recoveryCandidate.compressed,
+              recoveryCandidate.recoveryGeneration,
+            )
+          )
+        ) {
+          return null;
+        }
+        const quarantinedPath = await quarantineInvalidCompressedFile(
+          compressedPath,
+          recoveryCandidate,
+        );
+        if (!quarantinedPath) return null;
         clearRecordingMetadataFailure(compressedPath);
         throw new Error(
           `Existing compressed capture ${path.basename(compressedPath)} is invalid (${error.message || error}); moved it to ${path.basename(quarantinedPath)} and preserved ${path.basename(filePath)}`,
           { cause: error },
         );
       }
+      const contentsMatch = await plainAndGzipContentsMatch(
+        filePath,
+        compressedPath,
+      );
+      if (!contentsMatch) {
+        addEvent(
+          "capture-compression-conflict",
+          `Kept ${path.basename(filePath)} because existing ${path.basename(compressedPath)} contains different data`,
+        );
+        return null;
+      }
+      if (
+        recoveryCandidate &&
+        (
+          !startupRecoveryCandidateIsCurrent(recoveryCandidate) ||
+          recording?.filePath === filePath ||
+          !await startupRecoveryCandidateStillMatches(
+            filePath,
+            recoveryCandidate.source,
+            recoveryCandidate.recoveryGeneration,
+          ) ||
+          !await startupRecoveryCandidateStillMatches(
+            compressedPath,
+            recoveryCandidate.compressed,
+            recoveryCandidate.recoveryGeneration,
+          )
+        )
+      ) {
+        return null;
+      }
+      if (!startupRecoveryCandidateIsCurrent(recoveryCandidate)) return null;
       await fs.promises.unlink(filePath).catch(() => {});
-      await fs.promises.unlink(recordingMetadataPath(filePath)).catch(() => {});
+      await removeCompressedSourceMetadata(filePath, recoveryCandidate);
       clearRecordingMetadataFailure(filePath);
       return compressedPath;
     }
 
     const tempPath = `${compressedPath}.tmp`;
+    if (!startupRecoveryCandidateIsCurrent(recoveryCandidate)) return null;
+    let ownsTemporaryPath = false;
+    const temporaryStream = fs.createWriteStream(tempPath, { flags: "wx" });
+    temporaryStream.once("open", () => {
+      ownsTemporaryPath = true;
+    });
     try {
       await pipeline(
         fs.createReadStream(filePath),
         zlib.createGzip({ level: zlib.constants.Z_BEST_SPEED }),
-        fs.createWriteStream(tempPath, { flags: "w" }),
+        temporaryStream,
       );
       if (typeof app.ajrmMarineLoggerTestHooks?.afterCompressTemporaryFile === "function") {
         await app.ajrmMarineLoggerTestHooks.afterCompressTemporaryFile({
@@ -1484,13 +1582,96 @@ module.exports = function ajrmMarineLogger(app) {
         });
       }
       await validateGzipReadable(tempPath);
+      const contentsMatch = recoveryCandidate
+        ? await plainAndGzipContentsMatch(filePath, tempPath)
+        : true;
+      if (
+        (
+          !contentsMatch ||
+          (
+            recoveryCandidate &&
+            (
+              !startupRecoveryCandidateIsCurrent(recoveryCandidate) ||
+              recording?.filePath === filePath ||
+              !await startupRecoveryCandidateStillMatches(
+                filePath,
+                recoveryCandidate.source,
+                recoveryCandidate.recoveryGeneration,
+              )
+            )
+          )
+        )
+      ) {
+        if (ownsTemporaryPath) {
+          await fs.promises.unlink(tempPath).catch(() => {});
+        }
+        return null;
+      }
     } catch (error) {
+      if (ownsTemporaryPath) {
+        await fs.promises.unlink(tempPath).catch(() => {});
+      }
+      throw error;
+    }
+    try {
+      await fs.promises.link(tempPath, compressedPath);
+    } catch (error) {
+      if (ownsTemporaryPath) {
+        await fs.promises.unlink(tempPath).catch(() => {});
+      }
+      if (error?.code === "EEXIST") return null;
+      throw error;
+    }
+    let publishedContentsMatch = false;
+    try {
+      publishedContentsMatch = await plainAndGzipContentsMatch(
+        filePath,
+        compressedPath,
+      );
+    } catch (error) {
+      await fs.promises.unlink(compressedPath).catch(() => {});
       await fs.promises.unlink(tempPath).catch(() => {});
       throw error;
     }
-    await fs.promises.rename(tempPath, compressedPath);
+    if (!publishedContentsMatch) {
+      await fs.promises.unlink(compressedPath).catch(() => {});
+      await fs.promises.unlink(tempPath).catch(() => {});
+      return null;
+    }
+    if (
+      recoveryCandidate &&
+      (
+        !startupRecoveryCandidateIsCurrent(recoveryCandidate) ||
+        recording?.filePath === filePath ||
+        !await startupRecoveryCandidateStillMatches(
+          filePath,
+          recoveryCandidate.source,
+          recoveryCandidate.recoveryGeneration,
+        )
+      )
+    ) {
+      await fs.promises.unlink(compressedPath).catch(() => {});
+      await fs.promises.unlink(tempPath).catch(() => {});
+      return null;
+    }
+    await fs.promises.unlink(tempPath).catch(() => {});
+    if (
+      recoveryCandidate &&
+      (
+        !startupRecoveryCandidateIsCurrent(recoveryCandidate) ||
+        recording?.filePath === filePath ||
+        !await startupRecoveryCandidateStillMatches(
+          filePath,
+          recoveryCandidate.source,
+          recoveryCandidate.recoveryGeneration,
+        )
+      )
+    ) {
+      await fs.promises.unlink(compressedPath).catch(() => {});
+      return null;
+    }
     await fs.promises.unlink(filePath).catch(() => {});
-    await fs.promises.unlink(recordingMetadataPath(filePath)).catch(() => {});
+    await removeCompressedSourceMetadata(filePath, recoveryCandidate);
     clearRecordingMetadataFailure(filePath);
     clearRecordingMetadataFailure(compressedPath);
     stats.compressed += 1;
@@ -1498,18 +1679,63 @@ module.exports = function ajrmMarineLogger(app) {
     return compressedPath;
   }
 
-  async function quarantineInvalidCompressedFile(filePath) {
+  async function removeCompressedSourceMetadata(filePath, recoveryCandidate) {
+    const metadataPath = recordingMetadataPath(filePath);
+    if (!recoveryCandidate) {
+      await fs.promises.unlink(metadataPath).catch(() => {});
+      return;
+    }
+    if (recoveryCandidate.sourceMetadata) {
+      await unlinkUnchangedStartupFile(
+        metadataPath,
+        recoveryCandidate.sourceMetadata,
+        recoveryCandidate.recoveryGeneration,
+      );
+    }
+  }
+
+  async function quarantineInvalidCompressedFile(
+    filePath,
+    recoveryCandidate = null,
+  ) {
+    if (!startupRecoveryCandidateIsCurrent(recoveryCandidate)) return null;
     let quarantinePath = `${filePath}.corrupt`;
     let suffix = 2;
     while (await fileExists(quarantinePath)) {
       quarantinePath = `${filePath}.corrupt-${suffix}`;
       suffix += 1;
     }
+    if (
+      recoveryCandidate &&
+      !await startupRecoveryCandidateStillMatches(
+        filePath,
+        recoveryCandidate.compressed,
+        recoveryCandidate.recoveryGeneration,
+      )
+    ) {
+      return null;
+    }
     await fs.promises.rename(filePath, quarantinePath);
-    await fs.promises.rename(
-      recordingMetadataPath(filePath),
-      recordingMetadataPath(quarantinePath),
-    ).catch(() => {});
+    const metadataPath = recordingMetadataPath(filePath);
+    const quarantineMetadataPath = recordingMetadataPath(quarantinePath);
+    if (!recoveryCandidate) {
+      await fs.promises.rename(
+        metadataPath,
+        quarantineMetadataPath,
+      ).catch(() => {});
+    } else if (
+      recoveryCandidate.compressedMetadata &&
+      await startupRecoveryCandidateStillMatches(
+        metadataPath,
+        recoveryCandidate.compressedMetadata,
+        recoveryCandidate.recoveryGeneration,
+      )
+    ) {
+      await fs.promises.rename(
+        metadataPath,
+        quarantineMetadataPath,
+      ).catch(() => {});
+    }
     addEvent(
       "capture-quarantined",
       `Moved unreadable ${path.basename(filePath)} to ${path.basename(quarantinePath)}`,
@@ -1517,69 +1743,310 @@ module.exports = function ajrmMarineLogger(app) {
     return quarantinePath;
   }
 
-  function recoverStaleCaptureFiles() {
-    Promise.all([
-      removeOrphanCompressionTemps(paths.captures),
-      removeOrphanMetadataTemps(paths.captures),
-      removeOrphanMetadataTemps(paths.clips),
-      removeEmptyStaleCaptureFiles(paths.captures),
-    ])
-      .then(() => {
-        if (options.compressCompletedCaptures) return compressStaleCaptureFiles();
-        return null;
-      })
-      .catch((error) => logError("startup capture recovery failed", error));
-  }
-
-  async function removeOrphanCompressionTemps(directory) {
-    const names = await fs.promises.readdir(directory).catch(() => []);
-    const tempNames = names.filter((name) => name.endsWith(".jsonl.gz.tmp"));
-    await Promise.all(
-      tempNames.map((name) => fs.promises.unlink(path.join(directory, name)).catch(() => null)),
-    );
-    if (tempNames.length) {
-      addEvent("startup-cleanup", `Removed ${tempNames.length} incomplete capture compression file${tempNames.length === 1 ? "" : "s"}`);
+  async function recoverStaleCaptureFiles(
+    snapshot,
+    recoveryGeneration,
+    previousRecovery,
+  ) {
+    const beforeCleanup =
+      app.ajrmMarineLoggerTestHooks?.beforeStartupRecoveryCleanup;
+    try {
+      await Promise.resolve(previousRecovery).catch(() => {});
+      if (!startupRecoveryIsCurrent(recoveryGeneration)) return;
+      if (typeof beforeCleanup === "function") {
+        await beforeCleanup(snapshot);
+      }
+      if (!startupRecoveryIsCurrent(recoveryGeneration)) return;
+      await Promise.all([
+        removeOrphanCompressionTemps(
+          paths.captures,
+          snapshot.captures,
+          recoveryGeneration,
+        ),
+        removeOrphanMetadataTemps(
+          paths.captures,
+          snapshot.captures,
+          recoveryGeneration,
+        ),
+        removeOrphanMetadataTemps(
+          paths.clips,
+          snapshot.clips,
+          recoveryGeneration,
+        ),
+        removeEmptyStaleCaptureFiles(
+          paths.captures,
+          snapshot.captures,
+          recoveryGeneration,
+        ),
+      ]);
+      if (
+        startupRecoveryIsCurrent(recoveryGeneration) &&
+        options.compressCompletedCaptures
+      ) {
+        await compressStaleCaptureFiles(
+          snapshot.captures,
+          recoveryGeneration,
+        );
+      }
+    } catch (error) {
+      if (startupRecoveryIsCurrent(recoveryGeneration)) {
+        logError("startup capture recovery failed", error);
+      }
+    } finally {
+      const afterCleanup =
+        app.ajrmMarineLoggerTestHooks?.afterStartupRecoveryCleanup;
+      if (typeof afterCleanup === "function") {
+        await Promise.resolve(afterCleanup({
+          snapshot,
+          recoveryGeneration,
+          cancelled: !startupRecoveryIsCurrent(recoveryGeneration),
+        })).catch(() => {});
+      }
     }
   }
 
-  async function removeOrphanMetadataTemps(directory) {
-    const names = await fs.promises.readdir(directory).catch(() => []);
-    const tempNames = names.filter((name) => name.endsWith(".meta.json.tmp"));
-    await Promise.all(
-      tempNames.map((name) => fs.promises.unlink(path.join(directory, name)).catch(() => null)),
+  async function removeOrphanCompressionTemps(
+    directory,
+    snapshot,
+    recoveryGeneration,
+  ) {
+    const candidates = snapshot.filter(
+      (entry) => entry.name.endsWith(".jsonl.gz.tmp"),
     );
-    if (tempNames.length) {
-      addEvent("startup-cleanup", `Removed ${tempNames.length} incomplete metadata file${tempNames.length === 1 ? "" : "s"}`);
+    const removed = await removeUnchangedStartupFiles(
+      directory,
+      candidates,
+      recoveryGeneration,
+    );
+    if (removed) {
+      addEvent("startup-cleanup", `Removed ${removed} incomplete capture compression file${removed === 1 ? "" : "s"}`);
     }
   }
 
-  async function removeEmptyStaleCaptureFiles(directory) {
-    const files = await listJsonlFiles(directory);
-    const emptyFiles = files.filter((file) => file.name !== recording?.fileName && file.size === 0);
-    await Promise.all(
-      emptyFiles.map(async (file) => {
-        const filePath = path.join(directory, file.name);
-        await fs.promises.unlink(filePath).catch(() => null);
-        await fs.promises.unlink(recordingMetadataPath(filePath)).catch(() => null);
-      }),
+  async function removeOrphanMetadataTemps(
+    directory,
+    snapshot,
+    recoveryGeneration,
+  ) {
+    const candidates = snapshot.filter(
+      (entry) => entry.name.endsWith(".meta.json.tmp"),
     );
-    if (emptyFiles.length) {
-      addEvent("startup-cleanup", `Removed ${emptyFiles.length} empty stale capture log${emptyFiles.length === 1 ? "" : "s"}`);
+    const removed = await removeUnchangedStartupFiles(
+      directory,
+      candidates,
+      recoveryGeneration,
+    );
+    if (removed) {
+      addEvent("startup-cleanup", `Removed ${removed} incomplete metadata file${removed === 1 ? "" : "s"}`);
     }
   }
 
-  async function compressStaleCaptureFiles() {
-    const files = await listJsonlFiles(paths.captures);
+  async function removeEmptyStaleCaptureFiles(
+    directory,
+    snapshot,
+    recoveryGeneration,
+  ) {
+    const snapshotByName = new Map(
+      snapshot.map((entry) => [entry.name, entry]),
+    );
+    const emptyFiles = snapshot.filter(
+      (file) =>
+        file.name.endsWith(".jsonl") &&
+        file.name !== recording?.fileName &&
+        file.size === 0,
+    );
+    let removed = 0;
+    for (const file of emptyFiles) {
+      if (!startupRecoveryIsCurrent(recoveryGeneration)) break;
+      if (file.name === recording?.fileName) continue;
+      const filePath = path.join(directory, file.name);
+      if (!await unlinkUnchangedStartupFile(
+        filePath,
+        file,
+        recoveryGeneration,
+      )) {
+        continue;
+      }
+      const metadataPath = recordingMetadataPath(filePath);
+      const metadataSnapshot = snapshotByName.get(
+        path.basename(metadataPath),
+      );
+      if (metadataSnapshot) {
+        await unlinkUnchangedStartupFile(
+          metadataPath,
+          metadataSnapshot,
+          recoveryGeneration,
+        );
+      }
+      removed += 1;
+    }
+    if (removed) {
+      addEvent("startup-cleanup", `Removed ${removed} empty stale capture log${removed === 1 ? "" : "s"}`);
+    }
+  }
+
+  async function compressStaleCaptureFiles(snapshot, recoveryGeneration) {
+    const snapshotByName = new Map(
+      snapshot.map((entry) => [entry.name, entry]),
+    );
     const results = await Promise.all(
-      files
+      snapshot
         .filter((file) => file.name !== recording?.fileName && file.size > 0)
-        .map((file) => compressRecordingFile(path.join(paths.captures, file.name))),
+        .filter((file) => file.name.endsWith(".jsonl"))
+        .map((file) => compressRecordingFile(
+          path.join(paths.captures, file.name),
+          {
+            recoveryGeneration,
+            source: file,
+            compressed: snapshotByName.get(`${file.name}.gz`) || null,
+            sourceMetadata:
+              snapshotByName.get(`${file.name}.meta.json`) || null,
+            compressedMetadata:
+              snapshotByName.get(`${file.name}.gz.meta.json`) || null,
+          },
+        )),
     );
+    if (!startupRecoveryIsCurrent(recoveryGeneration)) return;
     const compressed = results.filter(Boolean).length;
     if (compressed) addEvent("startup-compression", `Compressed ${compressed} stale captures`);
     for (const compressedPath of results.filter(Boolean)) {
       queueRecordingMetadata(compressedPath, "startup-compression");
     }
+  }
+
+  function snapshotStartupRecoveryFiles() {
+    return {
+      captures: snapshotDirectoryFiles(
+        paths.captures,
+        (name) =>
+          name.endsWith(".jsonl") ||
+          name.endsWith(".jsonl.gz") ||
+          name.endsWith(".jsonl.gz.tmp") ||
+          name.endsWith(".meta.json") ||
+          name.endsWith(".meta.json.tmp"),
+      ),
+      clips: snapshotDirectoryFiles(
+        paths.clips,
+        (name) => name.endsWith(".meta.json.tmp"),
+      ),
+    };
+  }
+
+  function snapshotDirectoryFiles(directory, includeName) {
+    const entries = [];
+    const names = fs.readdirSync(directory, { withFileTypes: true });
+    for (const entry of names) {
+      if (
+        !entry.isFile() ||
+        (typeof includeName === "function" && !includeName(entry.name))
+      ) {
+        continue;
+      }
+      const filePath = path.join(directory, entry.name);
+      try {
+        const statsInfo = fs.statSync(filePath);
+        entries.push(startupRecoveryFileSnapshot(entry.name, statsInfo));
+      } catch {
+        // A concurrently removed file is not a startup recovery candidate.
+      }
+    }
+    return entries;
+  }
+
+  function startupRecoveryFileSnapshot(name, statsInfo) {
+    const identityAvailable =
+      Number.isSafeInteger(statsInfo.dev) &&
+      statsInfo.dev >= 0 &&
+      Number.isSafeInteger(statsInfo.ino) &&
+      statsInfo.ino > 0;
+    return {
+      name,
+      identityAvailable,
+      dev: statsInfo.dev,
+      ino: statsInfo.ino,
+      size: statsInfo.size,
+      mtimeMs: statsInfo.mtimeMs,
+      ctimeMs: statsInfo.ctimeMs,
+    };
+  }
+
+  function startupRecoveryFileMatches(statsInfo, snapshot) {
+    if (!statsInfo?.isFile() || !snapshot) return false;
+    const currentIdentityAvailable =
+      Number.isSafeInteger(statsInfo.dev) &&
+      statsInfo.dev >= 0 &&
+      Number.isSafeInteger(statsInfo.ino) &&
+      statsInfo.ino > 0;
+    return (
+      snapshot.identityAvailable === true &&
+      currentIdentityAvailable &&
+      statsInfo.dev === snapshot.dev &&
+      statsInfo.ino === snapshot.ino &&
+      statsInfo.size === snapshot.size &&
+      statsInfo.mtimeMs === snapshot.mtimeMs &&
+      statsInfo.ctimeMs === snapshot.ctimeMs
+    );
+  }
+
+  function startupRecoveryIsCurrent(recoveryGeneration) {
+    return (
+      Number.isSafeInteger(recoveryGeneration) &&
+      recoveryGeneration === startupRecoveryGeneration
+    );
+  }
+
+  function startupRecoveryCandidateIsCurrent(recoveryCandidate) {
+    return (
+      !recoveryCandidate ||
+      startupRecoveryIsCurrent(recoveryCandidate.recoveryGeneration)
+    );
+  }
+
+  async function startupRecoveryCandidateStillMatches(
+    filePath,
+    snapshot,
+    recoveryGeneration,
+  ) {
+    if (!startupRecoveryIsCurrent(recoveryGeneration)) return false;
+    const statsInfo = await fs.promises.stat(filePath).catch(() => null);
+    return (
+      startupRecoveryIsCurrent(recoveryGeneration) &&
+      startupRecoveryFileMatches(statsInfo, snapshot)
+    );
+  }
+
+  async function unlinkUnchangedStartupFile(
+    filePath,
+    snapshot,
+    recoveryGeneration,
+  ) {
+    if (!await startupRecoveryCandidateStillMatches(
+      filePath,
+      snapshot,
+      recoveryGeneration,
+    )) {
+      return false;
+    }
+    if (!startupRecoveryIsCurrent(recoveryGeneration)) return false;
+    return fs.promises.unlink(filePath)
+      .then(() => true)
+      .catch(() => false);
+  }
+
+  async function removeUnchangedStartupFiles(
+    directory,
+    candidates,
+    recoveryGeneration,
+  ) {
+    const results = await Promise.all(
+      candidates.map((entry) =>
+        unlinkUnchangedStartupFile(
+          path.join(directory, entry.name),
+          entry,
+          recoveryGeneration,
+        )),
+    );
+    return results.filter(Boolean).length;
   }
 
   async function copyBufferToStream(stream, cutoffMs, capture) {
@@ -3699,6 +4166,42 @@ async function validateGzipReadable(filePath) {
       },
     }),
   );
+}
+
+async function plainAndGzipContentsMatch(plainPath, gzipPath) {
+  const [plain, compressed] = await Promise.all([
+    recordingContentDigest(plainPath, false),
+    recordingContentDigest(gzipPath, true),
+  ]);
+  return (
+    plain.bytes === compressed.bytes &&
+    plain.sha256 === compressed.sha256
+  );
+}
+
+async function recordingContentDigest(filePath, compressed) {
+  const hash = crypto.createHash("sha256");
+  let bytes = 0;
+  const sink = new Writable({
+    write(chunk, _encoding, callback) {
+      bytes += chunk.length;
+      hash.update(chunk);
+      callback();
+    },
+  });
+  if (compressed) {
+    await pipeline(
+      fs.createReadStream(filePath),
+      zlib.createGunzip(),
+      sink,
+    );
+  } else {
+    await pipeline(fs.createReadStream(filePath), sink);
+  }
+  return {
+    bytes,
+    sha256: hash.digest("hex"),
+  };
 }
 
 function isCompressedLogName(value) {

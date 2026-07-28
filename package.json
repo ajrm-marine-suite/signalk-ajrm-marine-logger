@@ -1,10 +1,10 @@
 {
   "name": "signalk-ajrm-marine-logger",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "Signal K logging and replay utility for AJRM Marine Suite testing.",
   "main": "plugin/index.js",
   "scripts": {
-    "test": "node --test \"test/**/*.test.js\" && node --check plugin/index.js && node --check public/app.js"
+    "test": "node --test test/playback-operation.test.js && node --check plugin/index.js && node --check public/app.js"
   },
   "keywords": [
     "signalk-node-server-plugin",

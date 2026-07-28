@@ -96,13 +96,21 @@ Long captures are split into hourly files by default. The plugin starts a new pl
 
 On startup, AJRM Marine Logger recovers from abrupt shutdowns before starting a new capture. It removes empty stale `.jsonl` capture files that were opened but never received data, removes incomplete `.jsonl.gz.tmp` compression files, removes incomplete metadata temp files, and compresses leftover non-empty plain capture files from an earlier shutdown or crash. The web page has an **Auto-start capture** checkbox for starting a new capture automatically when the plugin starts, useful when you want to record everything each day. Auto-start begins at the current time without pre-capture backfill so restarted unattended captures do not duplicate the previous segment; manual **Start Capture** still uses the configured pre-capture minutes. Web-page playback/capture toggles are saved in `settings.json` under the log directory. Playback can automatically continue into the next chronological recording segment in the same list, so an hourly capture can be replayed like a playlist. The web page has an **Auto-play next file** checkbox for this. Clip extraction can span these segment boundaries when the requested end time is in a later file.
 
+Startup recovery uses an immutable snapshot taken before Logger exposes its
+controls. It rechecks each candidate's identity, size, and modification time
+before deleting or compressing it, so a capture created or changed after
+startup cannot be mistaken for a stale file. Recovery is cancelled across a
+plugin stop/restart, publishes gzip files without overwriting another file,
+and retains both a plain capture and an existing readable gzip when their
+contents differ.
+
 The file browser has **Logs**, **Clips**, and **Voyages** tabs. Logs are full capture files; clips are named extracts; voyages are zipped bundles containing capture segments plus supporting snapshots and system data. Select one file in the list, then use the shared **Load**, **Download**, or **Delete** buttons above the list. Files can be downloaded or deleted from the browser, except for the active capture or currently loaded playback file. Loading a voyage extracts it into a replay cache and plays the capture files inside the bundle; **Auto-play next file** continues through later capture segments in that voyage.
 
 ## Install on a Pi
 
 ```bash
 cd ~/.signalk
-npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.6.2 --omit=dev --no-package-lock
+npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.6.3 --omit=dev --no-package-lock
 sudo systemctl restart signalk
 ```
 
