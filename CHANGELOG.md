@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.6.2
+
+- Report the exact capture or clip whose metadata scan failed, retain that
+  failure in status without retrying on every refresh, and retry automatically
+  when the file's size or modification time changes.
+- Validate gzip output before replacing its plain source and before declaring a
+  recomputed-result segment complete. Quarantine an unreadable pre-existing
+  gzip while preserving the plain recording.
+- Protect every segment in an active recomputed-result session from deletion.
+- Add an explicit recomputed replay abort operation that stops injection
+  immediately, finalises and preserves partial result segments, and returns an
+  aborted/incomplete coverage manifest without waiting for calculation flush.
+- Preserve a structured playback failure with its file, cursor, and original
+  capture time in Logger status and recomputed-result summaries, and prevent a
+  failed recomputed run from silently resuming.
+- Expose guarded in-process playback start for Capture so starting a recomputed
+  result does not depend on a second authenticated browser command.
+- Replace replayed `navigation.datetime` values with the current replay
+  wall-clock timestamp in every playback mode, while retaining
+  `originalCapturedAt` provenance and reporting the explicit transformation.
+  This prevents enabled `@signalk/set-system-time` installations from moving
+  the host clock back to the voyage date while retaining the compatible
+  `strict-recorded-sensor-source-allowlist-v1` selection policy ID.
+- Pace replay from a monotonic clock instead of `Date.now()`, so NTP, manual, or
+  sensor-driven system-time corrections cannot turn a short source interval
+  into a stranded multi-day timer.
+
 ## 0.6.1
 
 - Add strict sensor-source voyage replay that filters derived, calculated, AJRM,

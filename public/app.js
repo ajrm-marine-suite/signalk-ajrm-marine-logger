@@ -225,6 +225,7 @@ function renderRecordings() {
       <button class="recording" type="button" data-file="${escapeHtml(item.fileName)}" data-kind="${item.kind}">
         <strong>${escapeHtml(item.fileName)}</strong>
         <span>${item.type}${item.compressed ? " · gzip" : ""}${item.bundle ? " · bundle" : ` · ${formatRange(item.from, item.to)} · ${formatLineCount(item)}`} · ${formatBytes(item.bytes)}</span>
+        ${item.metadataError ? `<em class="metadata-error">Metadata error: ${escapeHtml(item.metadataError)}</em>` : ""}
         ${item.comment ? `<em>${escapeHtml(item.comment)}</em>` : ""}
       </button>
     </div>`)
@@ -295,10 +296,13 @@ function renderPlayback() {
     ? new Date(playback.current).toLocaleString()
     : "-";
   const warmupText = playback.warmupActive ? " · warm-up" : "";
+  const playbackFailureText = playback.lastError
+    ? `FAILED: ${playback.lastError.message || "playback error"}`
+    : playback.lastReason || "ready";
   elements.playbackProgress.textContent = isLoading
     ? `Loading ${loadingPlayback.kind === "voyages" ? "voyage bundle" : "recording"}...`
     : playback.loaded
-    ? `${playback.cursor || 0} / ${playback.totalLines || 0} deltas (${playback.lastReason || "ready"}${warmupText})`
+    ? `${playback.cursor || 0} / ${playback.totalLines || 0} deltas (${playbackFailureText}${warmupText})`
     : "No recording loaded";
   if (playback.loaded && document.activeElement !== elements.playbackMode) {
     elements.playbackMode.value = playback.mode || "standard";
@@ -330,11 +334,15 @@ function renderPlayback() {
   const unmatchedSources = playback.sourcePolicy &&
     playback.sourcePolicy.unmatchedExplicitSensorSourceIds || [];
   const isolation = playback.liveInputIsolation || {};
+  const transformedDateTimes = filterStats.transformations &&
+    filterStats.transformations["navigation.datetime:replace-with-replay-wall-clock"] || 0;
   elements.sourcePolicyStatus.textContent = playback.loaded
-    ? `${playback.mode === "sensor-sources" ? `Strict sensor allow-list: ${resolvedSources.join(", ") || "none resolved"}${unmatchedSources.length ? ` · NOT RECORDED: ${unmatchedSources.join(", ")}` : ""}` : "Standard"} · ${filterStats.valuesSent || 0} kept / ${filterStats.valuesExcluded || 0} excluded · recorded catalog: ${formatSourceCatalog(sourceCatalog)}${isolation.physicalUpdatesSeen ? ` · WARNING ${isolation.physicalUpdatesSeen} live physical updates detected` : ""}`
+    ? `${playback.mode === "sensor-sources" ? `Strict sensor allow-list: ${resolvedSources.join(", ") || "none resolved"}${unmatchedSources.length ? ` · NOT RECORDED: ${unmatchedSources.join(", ")}` : ""}` : "Standard"} · ${filterStats.valuesSent || 0} kept / ${filterStats.valuesExcluded || 0} excluded · ${transformedDateTimes} navigation datetime value${transformedDateTimes === 1 ? "" : "s"} refreshed · recorded catalog: ${formatSourceCatalog(sourceCatalog)}${isolation.physicalUpdatesSeen ? ` · WARNING ${isolation.physicalUpdatesSeen} live physical updates detected` : ""}`
     : "Select a mode before loading";
   elements.resultCaptureStatus.textContent = playback.resultCapture && playback.resultCapture.active
-    ? `recording ${playback.resultCapture.fileName || ""}`
+    ? playback.lastError
+      ? `FAILED after ${playback.cursor || 0} deltas; partial result is still recording and must be aborted`
+      : `recording ${playback.resultCapture.fileName || ""}`
     : "not recording";
   const normalRecording = state.recording && state.recording.kind !== "recomputed-replay";
   const resultCaptureActive = Boolean(
@@ -353,6 +361,7 @@ function renderPlayback() {
     !playback.loaded ||
     playback.active ||
     Boolean(normalRecording) ||
+    (resultCaptureActive && Boolean(playback.lastError)) ||
     (resultCaptureActive && playbackAtEnd);
   elements.pauseButton.disabled =
     isLoading || !playback.active || resultCaptureActive;
@@ -1004,6 +1013,7 @@ function formatBytes(value) {
 }
 
 function formatLineCount(item) {
+  if (item && item.metadataError) return "metadata error";
   if (item && item.metadataPending) return "metadata pending";
   return `${(item && item.lines) || 0} deltas`;
 }

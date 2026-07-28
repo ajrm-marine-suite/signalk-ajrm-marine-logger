@@ -2,7 +2,9 @@ const fs = require("node:fs");
 const childProcess = require("node:child_process");
 const os = require("node:os");
 const path = require("node:path");
+const { performance } = require("node:perf_hooks");
 const readline = require("node:readline");
+const { Writable } = require("node:stream");
 const util = require("node:util");
 const zlib = require("node:zlib");
 const { pipeline } = require("node:stream/promises");
@@ -54,6 +56,7 @@ module.exports = function ajrmMarineLogger(app) {
   let runStartedAtMs = Date.now();
   const playbackOperation = createPlaybackOperation();
   const recordingMetadataCache = new Map();
+  const recordingMetadataFailures = new Map();
   const recordingMetadataJobs = new Set();
   const recentEvents = [];
   const stats = {
@@ -184,6 +187,12 @@ module.exports = function ajrmMarineLogger(app) {
         startReplayResultRecording(metadata),
       stopReplayResultCapture: (reason = "recomputed replay capture stopped") =>
         stopReplayResultRecording(reason),
+      abortReplayResultCapture: (reason = "recomputed replay capture aborted") =>
+        abortReplayResultRecording(reason),
+      startPlayback: (rate = 1) => {
+        startPlayback(normalizePlaybackRate(rate, playback.rate || 1));
+        return getPlaybackSummary();
+      },
       stopCapture: (reason = "external stopped") => {
         assertNormalCaptureCanStop();
         return stopRecording(reason);
@@ -327,6 +336,20 @@ module.exports = function ajrmMarineLogger(app) {
           ok: true,
           recording: await stopReplayResultRecording(
             "recomputed replay capture stopped",
+          ),
+        });
+      } catch (error) {
+        res.status(400).json({ ok: false, error: error.message });
+      }
+    }));
+
+    router.post(`${prefix}/playback/result-capture/abort`, write(async (req, res) => {
+      try {
+        const requestedReason = String(req.body?.reason || "").trim();
+        res.json({
+          ok: true,
+          recording: await abortReplayResultRecording(
+            requestedReason || "recomputed replay capture aborted by user",
           ),
         });
       } catch (error) {
@@ -836,6 +859,11 @@ module.exports = function ajrmMarineLogger(app) {
     if (playback.mode !== PLAYBACK_MODE_SENSOR_SOURCES) {
       throw new Error("Select Sensor sources only playback before starting recomputed replay capture");
     }
+    if (playback.lastError) {
+      throw new Error(
+        "Reload the voyage before starting a new recomputed capture after a playback failure",
+      );
+    }
     if (playback.cursor !== playback.startCursor) {
       throw new Error("Restart playback before starting a complete recomputed replay capture");
     }
@@ -922,11 +950,53 @@ module.exports = function ajrmMarineLogger(app) {
     return summary;
   }
 
-  async function stopRecordingAndWait(reason) {
+  async function abortReplayResultRecording(reason) {
+    if (recording?.kind !== "recomputed-replay") {
+      throw new Error("No recomputed replay capture is active");
+    }
+    const inputCoverage = buildPlaybackCoverage();
+    const abortReason = String(reason || "recomputed replay capture aborted");
+    haltPlaybackForReplayAbort(abortReason);
+    const summary = await stopRecordingAndWait(abortReason, {
+      aborted: true,
+      abortReason,
+      inputCoverage,
+    });
+    resetCalculationFlush();
+    resetPlaybackToStart(abortReason);
+    playback.paused = false;
+    publishPlaybackClock(false);
+    updateProviderStatus();
+    addEvent(
+      "replay-result-capture-aborted",
+      `${summary.fileName} aborted with ${summary.replayResult?.resultSegments?.segmentsTotal || 0} preserved partial segment(s)`,
+    );
+    return summary;
+  }
+
+  function haltPlaybackForReplayAbort(reason) {
+    clearTimeout(playback.timer);
+    playback.timer = null;
+    playback.active = false;
+    playback.paused = false;
+    playback.lastReason = reason;
+    playback.previousTs = null;
+    playback.sourceAnchorMs = null;
+    playback.pacingAnchorMs = null;
+    playback.lastLinePacingMs = null;
+    playbackOperation.invalidate();
+  }
+
+  async function stopRecordingAndWait(reason, resultOptions = {}) {
     if (!recording) return null;
     const segment = recording;
     const summary = getRecordingSummary();
     const resultCaptureSession = segment.resultCaptureSession || null;
+    if (resultCaptureSession && resultOptions.aborted === true) {
+      resultCaptureSession.aborted = true;
+      resultCaptureSession.abortReason =
+        String(resultOptions.abortReason || reason || "recomputed replay capture aborted");
+    }
     recording = null;
     let finalPath = segment.filePath;
     let resultSegments = null;
@@ -944,11 +1014,10 @@ module.exports = function ajrmMarineLogger(app) {
       if (options.compressCompletedCaptures) {
         finalPath = await compressRecordingFile(segment.filePath) || segment.filePath;
       }
-      await generateRecordingMetadata(finalPath, "capture-closed")
-        .catch((error) => logError("metadata generation failed", error));
+      await generateRecordingMetadataTracked(finalPath, "capture-closed");
     }
     const replayResult = segment.kind === "recomputed-replay"
-      ? replayResultSummary(segment, resultSegments)
+      ? replayResultSummary(segment, resultSegments, resultOptions)
       : null;
     const finalSummary = {
       ...summary,
@@ -970,6 +1039,8 @@ module.exports = function ajrmMarineLogger(app) {
     return {
       schemaVersion: 1,
       closed: false,
+      aborted: false,
+      abortReason: null,
       segments: [],
       finalizations: [],
       errors: [],
@@ -1021,11 +1092,7 @@ module.exports = function ajrmMarineLogger(app) {
         const message = error?.message || String(error);
         segment.resultSegment.error = message;
         segment.resultSegment.available = false;
-        session.errors.push({
-          index: segment.resultSegment.index,
-          fileName: segment.resultSegment.fileName,
-          error: message,
-        });
+        appendReplayResultSessionError(session, segment.resultSegment, message);
         logError("recomputed replay segment finalization failed", error);
         return segment.resultSegment;
       });
@@ -1061,9 +1128,15 @@ module.exports = function ajrmMarineLogger(app) {
     entry.bytes = fileSize(finalPath);
     entry.compressed = isCompressedLogName(finalPath);
     entry.finalized = true;
-    entry.available = entry.bytes > 0;
-    await generateRecordingMetadata(finalPath, reason)
-      .catch((error) => logError("metadata generation failed", error));
+    entry.available = false;
+    try {
+      await generateRecordingMetadataTracked(finalPath, reason, { rethrow: true });
+      entry.available = entry.bytes > 0;
+    } catch (error) {
+      entry.error =
+        `Replay result segment validation failed for ${entry.fileName}: ${error.message || error}`;
+      throw new Error(entry.error, { cause: error });
+    }
     return entry;
   }
 
@@ -1101,7 +1174,9 @@ module.exports = function ajrmMarineLogger(app) {
       }));
     const fileNames = materialized.map((entry) => entry.fileName);
     const uniqueFileNames = new Set(fileNames);
+    const aborted = session?.aborted === true;
     const complete = Boolean(
+      !aborted &&
       session?.closed === true &&
       materialized.length > 0 &&
       uniqueFileNames.size === materialized.length &&
@@ -1115,6 +1190,9 @@ module.exports = function ajrmMarineLogger(app) {
     return {
       schemaVersion: 1,
       complete,
+      incomplete: !complete,
+      aborted,
+      abortReason: aborted ? session?.abortReason || "recomputed replay capture aborted" : null,
       segmentsTotal: materialized.length,
       segmentsFinalized: materialized.filter((entry) => entry.finalized).length,
       lines: materialized.reduce((total, entry) => total + entry.lines, 0),
@@ -1144,11 +1222,38 @@ module.exports = function ajrmMarineLogger(app) {
         expectedBytes > 0 &&
         info.size === expectedBytes,
       );
+      if (entry.available && isCompressedLogName(filePath)) {
+        try {
+          await validateGzipReadable(filePath);
+        } catch (error) {
+          entry.available = false;
+          entry.error =
+            `Declared replay result segment is not readable gzip: ${entry.fileName}: ${error.message || error}`;
+          appendReplayResultSessionError(session, entry, entry.error);
+        }
+      }
       if (!entry.available && !entry.error) {
         entry.error = `Declared replay result segment is missing or changed: ${entry.fileName}`;
+        appendReplayResultSessionError(session, entry, entry.error);
       }
     }
     return replayResultSegmentManifestSnapshot(session);
+  }
+
+  function appendReplayResultSessionError(session, entry, error) {
+    if (!session || !entry || !error) return;
+    const duplicate = session.errors.some((item) =>
+      item.index === entry.index &&
+      item.fileName === entry.fileName &&
+      item.error === error,
+    );
+    if (!duplicate) {
+      session.errors.push({
+        index: entry.index,
+        fileName: entry.fileName,
+        error,
+      });
+    }
   }
 
   function beginCalculationFlush() {
@@ -1348,8 +1453,19 @@ module.exports = function ajrmMarineLogger(app) {
     const statsInfo = await fs.promises.stat(filePath).catch(() => null);
     if (!statsInfo?.isFile() || statsInfo.size === 0) return null;
     if (await fileExists(compressedPath)) {
+      try {
+        await validateGzipReadable(compressedPath);
+      } catch (error) {
+        const quarantinedPath = await quarantineInvalidCompressedFile(compressedPath);
+        clearRecordingMetadataFailure(compressedPath);
+        throw new Error(
+          `Existing compressed capture ${path.basename(compressedPath)} is invalid (${error.message || error}); moved it to ${path.basename(quarantinedPath)} and preserved ${path.basename(filePath)}`,
+          { cause: error },
+        );
+      }
       await fs.promises.unlink(filePath).catch(() => {});
       await fs.promises.unlink(recordingMetadataPath(filePath)).catch(() => {});
+      clearRecordingMetadataFailure(filePath);
       return compressedPath;
     }
 
@@ -1360,6 +1476,14 @@ module.exports = function ajrmMarineLogger(app) {
         zlib.createGzip({ level: zlib.constants.Z_BEST_SPEED }),
         fs.createWriteStream(tempPath, { flags: "w" }),
       );
+      if (typeof app.ajrmMarineLoggerTestHooks?.afterCompressTemporaryFile === "function") {
+        await app.ajrmMarineLoggerTestHooks.afterCompressTemporaryFile({
+          sourcePath: filePath,
+          temporaryPath: tempPath,
+          compressedPath,
+        });
+      }
+      await validateGzipReadable(tempPath);
     } catch (error) {
       await fs.promises.unlink(tempPath).catch(() => {});
       throw error;
@@ -1367,9 +1491,30 @@ module.exports = function ajrmMarineLogger(app) {
     await fs.promises.rename(tempPath, compressedPath);
     await fs.promises.unlink(filePath).catch(() => {});
     await fs.promises.unlink(recordingMetadataPath(filePath)).catch(() => {});
+    clearRecordingMetadataFailure(filePath);
+    clearRecordingMetadataFailure(compressedPath);
     stats.compressed += 1;
     addEvent("capture-compressed", `${path.basename(filePath)} compressed`);
     return compressedPath;
+  }
+
+  async function quarantineInvalidCompressedFile(filePath) {
+    let quarantinePath = `${filePath}.corrupt`;
+    let suffix = 2;
+    while (await fileExists(quarantinePath)) {
+      quarantinePath = `${filePath}.corrupt-${suffix}`;
+      suffix += 1;
+    }
+    await fs.promises.rename(filePath, quarantinePath);
+    await fs.promises.rename(
+      recordingMetadataPath(filePath),
+      recordingMetadataPath(quarantinePath),
+    ).catch(() => {});
+    addEvent(
+      "capture-quarantined",
+      `Moved unreadable ${path.basename(filePath)} to ${path.basename(quarantinePath)}`,
+    );
+    return quarantinePath;
   }
 
   function recoverStaleCaptureFiles() {
@@ -2012,6 +2157,11 @@ module.exports = function ajrmMarineLogger(app) {
     if (recording && recording.kind !== "recomputed-replay") {
       throw new Error("Stop normal capture before playback");
     }
+    if (recording?.kind === "recomputed-replay" && playback.lastError) {
+      throw new Error(
+        "Recomputed replay failed and cannot resume; abort the result capture and start a new run",
+      );
+    }
     if (recording?.kind === "recomputed-replay" && rate !== 1) {
       throw new Error("Recomputed replay capture is locked to 1x playback");
     }
@@ -2029,8 +2179,8 @@ module.exports = function ajrmMarineLogger(app) {
     playback.paused = false;
     playback.lastReason = "playing";
     playback.sourceAnchorMs = null;
-    playback.wallAnchorMs = null;
-    playback.lastLineWallMs = null;
+    playback.pacingAnchorMs = null;
+    playback.lastLinePacingMs = null;
     resetCalculationFlush();
     if (recording?.kind === "recomputed-replay" && recording.replayResult) {
       recording.replayResult.rate = rate;
@@ -2104,21 +2254,40 @@ module.exports = function ajrmMarineLogger(app) {
     updateProviderStatus();
   }
 
-  function finishPlayback(reason) {
+  function finishPlayback(reason, finishOptions = {}) {
     if (!playback.loaded) return;
     playback.active = false;
     playback.paused = false;
     playback.lastReason = reason;
+    if (finishOptions.error) {
+      playback.lastError = playbackFailureSummary(finishOptions.error);
+    }
     playback.previousTs = null;
     playback.sourceAnchorMs = null;
-    playback.wallAnchorMs = null;
-    playback.lastLineWallMs = null;
+    playback.pacingAnchorMs = null;
+    playback.lastLinePacingMs = null;
     playbackOperation.invalidate();
     clearTimeout(playback.timer);
     playback.timer = null;
     beginCalculationFlush();
     publishPlaybackClock(false);
     updateProviderStatus();
+  }
+
+  function playbackFailureSummary(error) {
+    return {
+      message: error?.message || String(error),
+      timestamp: new Date().toISOString(),
+      fileName: playback.fileName,
+      displayFileName: playback.displayFileName || playback.fileName,
+      sourceKind: playback.sourceKind,
+      voyageFileName: playback.voyageFileName,
+      segmentIndex: Number(playback.segmentIndex || 0),
+      segmentCursor: Number(playback.segmentCursor || 0),
+      cursor: Number(playback.cursor || 0),
+      capturedAt: playback.current || null,
+      originalCapturedAt: playback.originalCapturedAt || playback.current || null,
+    };
   }
 
   function stopPlayback(reason, { force = false } = {}) {
@@ -2148,8 +2317,8 @@ module.exports = function ajrmMarineLogger(app) {
     playback.current = playback.startCapturedAt || playback.from;
     playback.previousTs = null;
     playback.sourceAnchorMs = null;
-    playback.wallAnchorMs = null;
-    playback.lastLineWallMs = null;
+    playback.pacingAnchorMs = null;
+    playback.lastLinePacingMs = null;
     playback.lastReason = reason;
   }
 
@@ -2164,7 +2333,7 @@ module.exports = function ajrmMarineLogger(app) {
     playback.cursor = position.cursor;
     playback.current = position.capturedAt || playback.from;
     playback.previousTs = null;
-    playback.lastLineWallMs = null;
+    playback.lastLinePacingMs = null;
     playback.paused = true;
     playback.active = false;
     playbackOperation.invalidate();
@@ -2183,7 +2352,7 @@ module.exports = function ajrmMarineLogger(app) {
       sendNextPlaybackLine(generation).catch((error) => {
         if (!playbackOperation.isCurrent(generation)) return;
         logError("playback failed", error);
-        finishPlayback(error.message);
+        finishPlayback(error.message, { error });
       });
     }, Math.max(0, delayMs));
   }
@@ -2191,22 +2360,22 @@ module.exports = function ajrmMarineLogger(app) {
   function reschedulePlaybackForRateChange() {
     const currentMs = playback.previousTs;
     const nextMs = nextPlaybackSourceMs();
-    const lastWallMs = playback.lastLineWallMs;
+    const lastPacingMs = playback.lastLinePacingMs;
     if (
       !Number.isFinite(currentMs) ||
       !Number.isFinite(nextMs) ||
-      !Number.isFinite(lastWallMs)
+      !Number.isFinite(lastPacingMs)
     ) {
       scheduleNextPlaybackLine(0);
       return;
     }
     playback.sourceAnchorMs = currentMs;
-    playback.wallAnchorMs = Date.now();
+    playback.pacingAnchorMs = playbackPacingNowMs();
     scheduleNextPlaybackLine(playbackDelayToTimestamp(nextMs));
   }
 
   async function sendNextPlaybackLine(generation) {
-    const batchStartedMs = Date.now();
+    const batchStartedMs = playbackPacingNowMs();
     let nextDelayMs = 0;
     while (true) {
       if (
@@ -2270,19 +2439,19 @@ module.exports = function ajrmMarineLogger(app) {
       stats.playbackSent += 1;
 
       const currentMs = Date.parse(entry.capturedAt);
-      playback.lastLineWallMs = Date.now();
+      playback.lastLinePacingMs = playbackPacingNowMs();
       if (Number.isFinite(currentMs)) {
         playback.previousTs = currentMs;
         if (
           !Number.isFinite(playback.sourceAnchorMs) ||
-          !Number.isFinite(playback.wallAnchorMs)
+          !Number.isFinite(playback.pacingAnchorMs)
         ) {
           playback.sourceAnchorMs = currentMs;
-          playback.wallAnchorMs = playback.lastLineWallMs;
+          playback.pacingAnchorMs = playback.lastLinePacingMs;
         }
       }
       nextDelayMs = playbackDelayToTimestamp(nextPlaybackSourceMs());
-      if (nextDelayMs > 0 || Date.now() - batchStartedMs >= 40) break;
+      if (nextDelayMs > 0 || playbackPacingNowMs() - batchStartedMs >= 40) break;
     }
     scheduleNextPlaybackLine(nextDelayMs, generation);
   }
@@ -2292,10 +2461,19 @@ module.exports = function ajrmMarineLogger(app) {
     return calculatePlaybackDelayMs({
       nextSourceMs,
       sourceAnchorMs: playback.sourceAnchorMs,
-      wallAnchorMs: playback.wallAnchorMs,
+      pacingAnchorMs: playback.pacingAnchorMs,
       rate: playback.rate,
-      nowMs: Date.now(),
+      pacingNowMs: playbackPacingNowMs(),
     });
+  }
+
+  function playbackPacingNowMs() {
+    const testClock = app.ajrmMarineLoggerTestHooks?.monotonicNowMs;
+    if (typeof testClock === "function") {
+      const testValue = Number(testClock());
+      if (Number.isFinite(testValue)) return testValue;
+    }
+    return performance.now();
   }
 
   function nextPlaybackSourceMs() {
@@ -2357,9 +2535,9 @@ module.exports = function ajrmMarineLogger(app) {
     }
 
     const previousSourceMs = Date.parse(playback.current || "");
-    const previousWallMs = Number.isFinite(playback.lastLineWallMs)
-      ? playback.lastLineWallMs
-      : Date.now();
+    const previousPacingMs = Number.isFinite(playback.lastLinePacingMs)
+      ? playback.lastLinePacingMs
+      : playbackPacingNowMs();
     activatePlaybackSegment(nextSegmentIndex, 0);
     playback.active = true;
     playback.paused = false;
@@ -2367,11 +2545,11 @@ module.exports = function ajrmMarineLogger(app) {
     playback.sourceAnchorMs = Number.isFinite(previousSourceMs)
       ? previousSourceMs
       : null;
-    playback.wallAnchorMs = Number.isFinite(previousSourceMs)
-      ? previousWallMs
+    playback.pacingAnchorMs = Number.isFinite(previousSourceMs)
+      ? previousPacingMs
       : null;
-    playback.lastLineWallMs = Number.isFinite(previousSourceMs)
-      ? previousWallMs
+    playback.lastLinePacingMs = Number.isFinite(previousSourceMs)
+      ? previousPacingMs
       : null;
     const generation = playbackOperation.begin();
     stats.autoAdvanced += 1;
@@ -2390,6 +2568,11 @@ module.exports = function ajrmMarineLogger(app) {
     if (recording?.fileName === fileName) {
       throw new Error("Stop capture before deleting the active log file");
     }
+    if (activeReplayResultSessionHasFile(fileName)) {
+      throw new Error(
+        "Finish or abort the recomputed replay capture before deleting one of its result segments",
+      );
+    }
     if (playback.loaded && playback.fileName === fileName) {
       throw new Error("Stop playback or load another file before deleting this file");
     }
@@ -2398,8 +2581,24 @@ module.exports = function ajrmMarineLogger(app) {
     if (!statsInfo?.isFile()) throw new Error(`File not found: ${fileName}`);
     await fs.promises.unlink(filePath);
     await fs.promises.unlink(recordingMetadataPath(filePath)).catch(() => {});
+    clearRecordingMetadataFailure(filePath);
     addEvent("file-deleted", `Deleted ${fileName}`);
     return { kind: normalizeRecordingKind(kind), fileName };
+  }
+
+  function activeReplayResultSessionHasFile(fileName) {
+    const session = recording?.kind === "recomputed-replay"
+      ? recording.resultCaptureSession
+      : null;
+    if (!session) return false;
+    return session.segments.some((entry) => {
+      const names = [
+        entry.fileName,
+        path.basename(entry.filePath || ""),
+        path.basename(entry.finalPath || ""),
+      ].filter(Boolean);
+      return names.includes(fileName);
+    });
   }
 
   function recordingDirectoryForKind(kind) {
@@ -2616,6 +2815,7 @@ module.exports = function ajrmMarineLogger(app) {
         from: meta.from,
         to: meta.to,
         metadataPending: meta.metadataPending === true,
+        metadataError: meta.metadataError || null,
       });
     }
     return result;
@@ -2634,8 +2834,12 @@ module.exports = function ajrmMarineLogger(app) {
     const cached = recordingMetadataCache.get(cacheKey);
     if (cached) return cached;
 
+    const failure = recordingMetadataFailureForFile(fullPath, file);
+    if (failure) return recordingMetadataFailureSummary(failure);
+
     const sidecar = readRecordingMetadataFileSync(fullPath, file);
     if (sidecar) {
+      clearRecordingMetadataFailure(fullPath);
       recordingMetadataCache.set(cacheKey, sidecar);
       return sidecar;
     }
@@ -2663,8 +2867,12 @@ module.exports = function ajrmMarineLogger(app) {
     const cached = recordingMetadataCache.get(cacheKey);
     if (cached) return cached;
 
+    const failure = recordingMetadataFailureForFile(fullPath, file);
+    if (failure) return recordingMetadataFailureSummary(failure);
+
     const sidecar = await readRecordingMetadataFile(fullPath, file);
     if (sidecar) {
+      clearRecordingMetadataFailure(fullPath);
       recordingMetadataCache.set(cacheKey, sidecar);
       return sidecar;
     }
@@ -2672,20 +2880,45 @@ module.exports = function ajrmMarineLogger(app) {
     for (const key of recordingMetadataCache.keys()) {
       if (key.startsWith(`${fullPath}:`)) recordingMetadataCache.delete(key);
     }
-    const meta = await scanFile(fullPath, Infinity, false);
-    await writeRecordingMetadataFile(fullPath, null, meta);
-    return meta;
+    const meta = await generateRecordingMetadataTracked(
+      fullPath,
+      "metadata-missing",
+    );
+    return meta || recordingMetadataFailureSummary(
+      recordingMetadataFailures.get(fullPath),
+    );
   }
 
   function queueRecordingMetadata(filePath, reason) {
     if (!filePath || recording?.filePath === filePath) return;
     if (recordingMetadataJobs.has(filePath)) return;
+    const signature = recordingFileSignatureSync(filePath);
+    const failure = recordingMetadataFailures.get(filePath);
+    if (failure && failure.signature === signature) return;
+    if (failure) recordingMetadataFailures.delete(filePath);
     recordingMetadataJobs.add(filePath);
     setTimeout(() => {
-      generateRecordingMetadata(filePath, reason)
-        .catch((error) => logError("metadata generation failed", error))
+      generateRecordingMetadataTracked(filePath, reason, { signature })
         .finally(() => recordingMetadataJobs.delete(filePath));
     }, 0);
+  }
+
+  async function generateRecordingMetadataTracked(
+    filePath,
+    reason,
+    trackingOptions = {},
+  ) {
+    const signature =
+      trackingOptions.signature || recordingFileSignatureSync(filePath);
+    try {
+      const meta = await generateRecordingMetadata(filePath, reason);
+      clearRecordingMetadataFailure(filePath);
+      return meta;
+    } catch (error) {
+      rememberRecordingMetadataFailure(filePath, signature, error, reason);
+      if (trackingOptions.rethrow === true) throw error;
+      return null;
+    }
   }
 
   async function generateRecordingMetadata(filePath, reason) {
@@ -2701,6 +2934,68 @@ module.exports = function ajrmMarineLogger(app) {
     await writeRecordingMetadataFile(filePath, statsInfo, meta);
     addEvent("metadata", `Indexed ${path.basename(filePath)}${reason ? ` (${reason})` : ""}`);
     return meta;
+  }
+
+  function recordingFileSignature(file) {
+    if (!file) return null;
+    const size = Number(file.size);
+    const mtimeMs = Number(file.mtimeMs);
+    if (!Number.isFinite(size) || !Number.isFinite(mtimeMs)) return null;
+    return `${size}:${mtimeMs}`;
+  }
+
+  function recordingFileSignatureSync(filePath) {
+    try {
+      return recordingFileSignature(fs.statSync(filePath));
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function recordingMetadataFailureForFile(filePath, file) {
+    const failure = recordingMetadataFailures.get(filePath);
+    if (!failure) return null;
+    const signature = recordingFileSignature(file);
+    if (signature && failure.signature === signature) return failure;
+    recordingMetadataFailures.delete(filePath);
+    return null;
+  }
+
+  function recordingMetadataFailureSummary(failure) {
+    return {
+      lines: null,
+      from: null,
+      to: null,
+      metadataPending: false,
+      metadataError: failure?.error || "Metadata generation failed",
+    };
+  }
+
+  function rememberRecordingMetadataFailure(filePath, signature, error, reason) {
+    const errorMessage = error?.message || String(error);
+    const previous = recordingMetadataFailures.get(filePath);
+    const failure = {
+      signature,
+      error: errorMessage,
+      reason: reason || null,
+      failedAt: new Date().toISOString(),
+    };
+    recordingMetadataFailures.set(filePath, failure);
+    if (
+      !previous ||
+      previous.signature !== failure.signature ||
+      previous.error !== failure.error
+    ) {
+      logError(
+        `metadata generation failed for ${path.basename(filePath)}`,
+        error,
+      );
+    }
+    return failure;
+  }
+
+  function clearRecordingMetadataFailure(filePath) {
+    if (filePath) recordingMetadataFailures.delete(filePath);
   }
 
   function readRecordingMetadataFileSync(filePath, file) {
@@ -3040,10 +3335,11 @@ module.exports = function ajrmMarineLogger(app) {
       rate: 1,
       previousTs: null,
       sourceAnchorMs: null,
-      wallAnchorMs: null,
-      lastLineWallMs: null,
+      pacingAnchorMs: null,
+      lastLinePacingMs: null,
       timer: null,
       lastReason: "not loaded",
+      lastError: null,
       offsets: [],
       times: [],
       segments: [],
@@ -3079,18 +3375,37 @@ module.exports = function ajrmMarineLogger(app) {
     resultSegments = replayResultSegmentManifestSnapshot(
       segment?.resultCaptureSession,
     ),
+    resultOptions = {},
   ) {
-    const inputCoverage = buildPlaybackCoverage();
+    const inputCoverage = resultOptions.inputCoverage || buildPlaybackCoverage();
+    const aborted =
+      resultOptions.aborted === true ||
+      segment?.resultCaptureSession?.aborted === true;
+    const abortReason = aborted
+      ? String(
+          resultOptions.abortReason ||
+          segment?.resultCaptureSession?.abortReason ||
+          "recomputed replay capture aborted",
+        )
+      : null;
     const coverage = {
       ...inputCoverage,
       inputComplete: inputCoverage.complete === true,
       resultSegmentsComplete: resultSegments?.complete === true,
       complete:
+        !aborted &&
         inputCoverage.complete === true &&
         resultSegments?.complete === true,
+      aborted,
+      abortReason,
     };
     return {
       ...segment.replayResult,
+      aborted,
+      incomplete: aborted || coverage.complete !== true,
+      abortReason,
+      playbackFailed: Boolean(playback.lastError),
+      playbackError: playback.lastError ? { ...playback.lastError } : null,
       sourcePolicy: playback.sourcePolicy,
       sourceCatalog: playback.sourceCatalog,
       originalFrom: playback.captureFrom || segment.replayResult.originalFrom,
@@ -3154,6 +3469,7 @@ module.exports = function ajrmMarineLogger(app) {
         : { active: false },
       rate: playback.rate,
       lastReason: playback.lastReason,
+      lastError: playback.lastError ? { ...playback.lastError } : null,
       compressed: isCompressedLogName(playback.fileName || ""),
       autoAdvance: options.autoAdvancePlayback,
     };
@@ -3273,6 +3589,7 @@ module.exports = function ajrmMarineLogger(app) {
                     resultCapture: recording?.kind === "recomputed-replay",
                     playing: playback.active,
                     rate: playback.rate,
+                    lastError: playback.lastError ? { ...playback.lastError } : null,
                   }
                 : {
                     active: false,
@@ -3297,6 +3614,7 @@ module.exports = function ajrmMarineLogger(app) {
                       Number.isFinite(playback.calculationFlushUntilMs) &&
                       Date.now() <= playback.calculationFlushUntilMs,
                     resultCapture: recording?.kind === "recomputed-replay",
+                    lastError: playback.lastError ? { ...playback.lastError } : null,
                   },
             },
           ],
@@ -3369,6 +3687,18 @@ function createLogReadStream(filePath) {
   source.on("error", (error) => stream.destroy(error));
   stream.setEncoding("utf8");
   return stream;
+}
+
+async function validateGzipReadable(filePath) {
+  await pipeline(
+    fs.createReadStream(filePath),
+    zlib.createGunzip(),
+    new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    }),
+  );
 }
 
 function isCompressedLogName(value) {
@@ -3567,24 +3897,25 @@ function playbackModeContract(mode) {
 function calculatePlaybackDelayMs({
   nextSourceMs,
   sourceAnchorMs,
-  wallAnchorMs,
+  pacingAnchorMs,
   rate,
-  nowMs,
+  pacingNowMs,
 }) {
   if (rate === "max") return 0;
   const numericRate = Number(rate || 1);
   if (
     !Number.isFinite(nextSourceMs) ||
     !Number.isFinite(sourceAnchorMs) ||
-    !Number.isFinite(wallAnchorMs) ||
-    !Number.isFinite(nowMs) ||
+    !Number.isFinite(pacingAnchorMs) ||
+    !Number.isFinite(pacingNowMs) ||
     !Number.isFinite(numericRate) ||
     numericRate <= 0
   ) {
     return 0;
   }
-  const targetWallMs = wallAnchorMs + Math.max(0, nextSourceMs - sourceAnchorMs) / numericRate;
-  return Math.max(0, targetWallMs - nowMs);
+  const targetPacingMs =
+    pacingAnchorMs + Math.max(0, nextSourceMs - sourceAnchorMs) / numericRate;
+  return Math.max(0, targetPacingMs - pacingNowMs);
 }
 
 function fileSize(filePath) {

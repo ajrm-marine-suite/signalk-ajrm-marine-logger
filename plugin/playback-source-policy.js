@@ -10,6 +10,17 @@ const SENSOR_SOURCE_POLICY_ID = "strict-recorded-sensor-source-allowlist-v1";
 const DEFAULT_SENSOR_SOURCE_PREFIXES = Object.freeze(["YDEN"]);
 const DEFAULT_SENSOR_SOURCE_IDS = Object.freeze([]);
 const ALWAYS_EXCLUDED_NAMESPACES = Object.freeze(["plugins", "notifications"]);
+const NAVIGATION_DATETIME_PATH = "navigation.datetime";
+const NAVIGATION_DATETIME_TRANSFORM_ID =
+  "navigation.datetime:replace-with-replay-wall-clock";
+const REPLAY_VALUE_TRANSFORMS = Object.freeze([
+  Object.freeze({
+    id: NAVIGATION_DATETIME_TRANSFORM_ID,
+    path: NAVIGATION_DATETIME_PATH,
+    action: "replace-with-replay-wall-clock",
+    reason: "prevent historical replay data from changing the host system clock",
+  }),
+]);
 
 function normalizePlaybackMode(value) {
   return PLAYBACK_MODES.has(value) ? value : PLAYBACK_MODE_STANDARD;
@@ -88,6 +99,7 @@ function createSourcePolicy(mode, sourceSelection, sourceCatalog = {}) {
       ? "exclude"
       : "include",
     alwaysExcludedNamespaces: [...ALWAYS_EXCLUDED_NAMESPACES],
+    valueTransforms: REPLAY_VALUE_TRANSFORMS.map((entry) => ({ ...entry })),
   };
 }
 
@@ -146,6 +158,10 @@ function createFilterStats() {
     valuesSeen: 0,
     valuesSent: 0,
     valuesExcluded: 0,
+    valuesTransformed: 0,
+    transformations: {
+      [NAVIGATION_DATETIME_TRANSFORM_ID]: 0,
+    },
     excludedByReason: {
       pathNamespace: 0,
       missingSource: 0,
@@ -167,12 +183,17 @@ function mergeFilterStats(target, addition) {
     "valuesSeen",
     "valuesSent",
     "valuesExcluded",
+    "valuesTransformed",
   ]) {
     output[key] = Number(output[key] || 0) + Number(source[key] || 0);
   }
   for (const [reason, count] of Object.entries(source.excludedByReason || {})) {
     output.excludedByReason[reason] =
       Number(output.excludedByReason[reason] || 0) + Number(count || 0);
+  }
+  for (const [transform, count] of Object.entries(source.transformations || {})) {
+    output.transformations[transform] =
+      Number(output.transformations[transform] || 0) + Number(count || 0);
   }
   for (const [sourceId, counts] of Object.entries(source.sources || {})) {
     const current = output.sources[sourceId] || {
@@ -268,10 +289,20 @@ function replayDeltaWithPolicy(delta, {
         sourceStats.valuesExcluded += 1;
         continue;
       }
-      const value = refreshEmbeddedSignalKTimestamp(
+      const refreshedValue = refreshEmbeddedSignalKTimestamp(
         stripDerivedReplayFields(entry.value),
         timestamp,
       );
+      const transformed = applyReplayValueTransforms(
+        entry?.path,
+        refreshedValue,
+        timestamp,
+      );
+      const value = transformed.value;
+      if (transformed.transformed) {
+        stats.valuesTransformed += 1;
+        stats.transformations[NAVIGATION_DATETIME_TRANSFORM_ID] += 1;
+      }
       if (isEmptyReplayValue(value)) {
         stats.excludedByReason.emptyAfterSanitizing += 1;
         stats.valuesExcluded += 1;
@@ -334,6 +365,61 @@ function refreshEmbeddedSignalKTimestamp(value, timestamp) {
   return output;
 }
 
+function applyReplayValueTransforms(pathName, value, timestamp) {
+  const pathText = String(pathName || "");
+  if (pathText === NAVIGATION_DATETIME_PATH) {
+    return { value: timestamp, transformed: true };
+  }
+
+  const baseSegments = pathText ? pathText.split(".") : [];
+  const targetSegments = NAVIGATION_DATETIME_PATH.split(".");
+  if (
+    baseSegments.length >= targetSegments.length ||
+    !baseSegments.every((segment, index) => segment === targetSegments[index])
+  ) {
+    return { value, transformed: false };
+  }
+  const relativeSegments = targetSegments.slice(baseSegments.length);
+  const replacement = replaceNestedDateTimeValue(
+    value,
+    relativeSegments,
+    timestamp,
+  );
+  return replacement.transformed
+    ? { value: replacement.value, transformed: true }
+    : { value, transformed: false };
+}
+
+function replaceNestedDateTimeValue(value, segments, timestamp) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !segments.length) {
+    return { value, transformed: false };
+  }
+  const [segment, ...remaining] = segments;
+  if (!Object.prototype.hasOwnProperty.call(value, segment)) {
+    return { value, transformed: false };
+  }
+  if (!remaining.length) {
+    const current = value[segment];
+    const replacement =
+      current &&
+      typeof current === "object" &&
+      !Array.isArray(current) &&
+      Object.prototype.hasOwnProperty.call(current, "value")
+        ? { ...current, value: timestamp, timestamp }
+        : timestamp;
+    return {
+      value: { ...value, [segment]: replacement },
+      transformed: true,
+    };
+  }
+  const child = replaceNestedDateTimeValue(value[segment], remaining, timestamp);
+  if (!child.transformed) return { value, transformed: false };
+  return {
+    value: { ...value, [segment]: child.value },
+    transformed: true,
+  };
+}
+
 function isEmptyReplayValue(value) {
   return value &&
     typeof value === "object" &&
@@ -347,7 +433,9 @@ module.exports = {
   DEFAULT_SENSOR_SOURCE_PREFIXES,
   PLAYBACK_MODE_SENSOR_SOURCES,
   PLAYBACK_MODE_STANDARD,
+  REPLAY_VALUE_TRANSFORMS,
   SENSOR_SOURCE_POLICY_ID,
+  applyReplayValueTransforms,
   createFilterStats,
   createSourcePolicy,
   mergeFilterStats,

@@ -102,7 +102,7 @@ The file browser has **Logs**, **Clips**, and **Voyages** tabs. Logs are full ca
 
 ```bash
 cd ~/.signalk
-npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.6.1 --omit=dev --no-package-lock
+npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.6.2 --omit=dev --no-package-lock
 sudo systemctl restart signalk
 ```
 
@@ -132,6 +132,13 @@ The legacy `/plugins/signalk-ajrm-marine-logger/...` route still exists for comp
   recomputed-replay result capture is the sole exception.
 - Playback publishes `plugins.ajrmMarineLogger.playback` as a replay clock so AJRM Marine can show an explicit replay badge and avoid guessing from stale timestamps. The value includes whether playback is active/playing, the recording time, file name, display file name, source kind, voyage name when applicable, and rate; speed changes are published dynamically while playback is running.
 - Playback injects captured raw input deltas back into Signal K with `app.handleMessage`, using fresh replay-time update timestamps and refreshed embedded source timestamps. Derived `plugins.*` and `notifications.*` paths are recorded for forensic use but are not republished during normal playback, so current apps recompute derived state from the replayed inputs.
+- Replay preserves the physical `navigation.datetime` sensor path but replaces
+  its historical scalar value with the same current wall-clock ISO timestamp
+  used on the replayed update. This prevents Signal K's optional
+  `@signalk/set-system-time` plugin from moving the host clock back to the
+  voyage date. The transformation rule and count are explicit in the source
+  policy/filter diagnostics. Playback pacing uses a monotonic clock, so an
+  unrelated host-clock correction cannot strand the next replay timer.
 - Sensor-only replay uses a strict, auditable allow-list resolved from the
   recording before playback. Missing, unknown, and nonmatching sources are
   excluded. The UI shows both the complete source catalogue and resolved exact
@@ -155,6 +162,12 @@ The legacy `/plugins/signalk-ajrm-marine-logger/...` route still exists for comp
   into multiple output files. Logger finalises them all and returns an explicit
   `resultSegments` manifest; final replay coverage remains incomplete if any
   declared result file is missing, changed, or unfinished.
+- If replay fails, Logger retains a structured `playback.lastError` with the
+  affected file, segment, cursor, and original capture time. A failed
+  recomputed run cannot silently resume. Capture can explicitly abort it;
+  Logger immediately stops injection, finalises and preserves partial result
+  segments, and returns an `aborted`/incomplete manifest without the normal
+  calculation quiet-time wait.
 - Disable or disconnect live sensor inputs for a valid recomputation test.
   Logger quarantines physical-source deltas that arrive outside its own replay
   injection and records their source/count as a contamination warning, but it

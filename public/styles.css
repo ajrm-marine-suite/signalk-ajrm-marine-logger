@@ -395,6 +395,10 @@ label {
   white-space: pre-wrap;
 }
 
+.recording em.metadata-error {
+  color: #ffb7c4;
+}
+
 .delete-file {
   min-width: 82px;
   border-color: #7e3a49;
