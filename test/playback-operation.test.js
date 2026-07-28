@@ -1580,6 +1580,10 @@ test("recomputed playback failure remains explicit until the partial result is a
       mode: "sensor-sources",
       sensorSourceIds: ["YDEN.2"],
     });
+    await waitFor(async () => {
+      const status = await app.ajrmMarineLoggerApi.status();
+      return status.playback.loaded === true;
+    }, 5000);
     await invoke(routes, "POST", "/playback/result-capture/start", {
       parentVoyage: "voyage-failed-parent.zip",
     });
