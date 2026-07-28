@@ -106,11 +106,28 @@ contents differ.
 
 The file browser has **Logs**, **Clips**, and **Voyages** tabs. Logs are full capture files; clips are named extracts; voyages are zipped bundles containing capture segments plus supporting snapshots and system data. Select one file in the list, then use the shared **Load**, **Download**, or **Delete** buttons above the list. Files can be downloaded or deleted from the browser, except for the active capture or currently loaded playback file. Loading a voyage extracts it into a replay cache and plays the capture files inside the bundle; **Auto-play next file** continues through later capture segments in that voyage.
 
+The first load of a voyage or compressed recording also creates persistent
+replay indexes containing its validated line offsets, timestamps, and recorded
+sensor-source catalogue. Loading the unchanged source again reuses both the
+materialised files and these indexes, avoiding another ZIP extraction, gzip
+expansion, or full JSONL scan. A changed source size, modification time, or
+filesystem change time invalidates the corresponding cache.
+
+Replay cache use is shown in the Logger Status panel. By default Logger keeps
+at most 8 GB of replay cache and reserves at least 4 GB of free filesystem
+space. These explicit limits can be changed in the Signal K plugin
+configuration with **Maximum replay cache size in GB** and **Minimum free disk
+space after replay caching in GB**. Every five minutes and around cache-building
+operations, Logger removes least-recently-used inactive entries until both
+limits are satisfied. Files belonging to the currently loaded or active replay
+are protected from removal. The source voyage ZIP and source capture files are
+never cache-cleanup targets.
+
 ## Install on a Pi
 
 ```bash
 cd ~/.signalk
-npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.6.4 --omit=dev --no-package-lock
+npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.6.5 --omit=dev --no-package-lock
 sudo systemctl restart signalk
 ```
 

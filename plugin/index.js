@@ -34,6 +34,9 @@ const POWER_INTENT_PATH = "plugins.ajrmMarinePiController.power.intent";
 const DEFAULT_LOG_DIRECTORY = "~/AJRMMarineLogs";
 const LEGACY_LOG_DIRECTORY = ["~/Capture", "PlusLogs"].join("");
 const RECORDING_METADATA_VERSION = 1;
+const REPLAY_INDEX_VERSION = 1;
+const REPLAY_CACHE_MANIFEST_VERSION = 1;
+const GIBIBYTE = 1024 ** 3;
 const REPLAY_CALCULATION_FLUSH_MS = 3000;
 const REPLAY_CALCULATION_FLUSH_MAX_MS = 15000;
 const AJRM_MARINE_LOGGER_API_REGISTRY = Symbol.for("mcdonaldajr.ajrmMarineLoggerApi");
@@ -57,6 +60,16 @@ module.exports = function ajrmMarineLogger(app) {
   let runStartedAtMs = Date.now();
   let startupRecoveryGeneration = 0;
   let startupRecoveryPromise = Promise.resolve();
+  let replayCacheMaintenancePromise = null;
+  let lastReplayCacheMaintenanceMs = 0;
+  let replayCacheLoadInProgress = false;
+  let replayCacheStatus = {
+    entries: 0,
+    bytes: 0,
+    removedEntries: 0,
+    removedBytes: 0,
+    updatedAt: null,
+  };
   const playbackOperation = createPlaybackOperation();
   const recordingMetadataCache = new Map();
   const recordingMetadataFailures = new Map();
@@ -147,6 +160,24 @@ module.exports = function ajrmMarineLogger(app) {
           "Debug option. When enabled, voyage replay starts at the earliest bundled capture record instead of the warm-up point.",
         default: false,
       },
+      replayCacheMaxGigabytes: {
+        type: "integer",
+        title: "Maximum replay cache size in GB",
+        description:
+          "Logger removes the least-recently-used inactive replay caches when this limit is exceeded.",
+        default: 8,
+        minimum: 1,
+        maximum: 1024,
+      },
+      replayCacheMinimumFreeGigabytes: {
+        type: "integer",
+        title: "Minimum free disk space after replay caching in GB",
+        description:
+          "Logger removes least-recently-used inactive replay caches when free disk space falls below this reserve.",
+        default: 4,
+        minimum: 0,
+        maximum: 1024,
+      },
       includePaths: {
         type: "array",
         title: "Signal K paths to record",
@@ -223,6 +254,9 @@ module.exports = function ajrmMarineLogger(app) {
       try {
         rotateBufferIfNeeded(new Date());
         pruneBuffer();
+        if (Date.now() - lastReplayCacheMaintenanceMs >= 5 * 60 * 1000) {
+          requestReplayCacheMaintenance();
+        }
       } catch (error) {
         logError("maintenance failed", error);
       }
@@ -231,6 +265,7 @@ module.exports = function ajrmMarineLogger(app) {
     statusTimer = setInterval(updateProviderStatus, 10000);
     updateProviderStatus();
     addEvent("started", `AJRM Marine Logger v${packageInfo.version} started`);
+    requestReplayCacheMaintenance();
   };
 
   plugin.stop = () => {
@@ -603,6 +638,18 @@ module.exports = function ajrmMarineLogger(app) {
       autoStartCapture: value.autoStartCapture === true,
       replayWarmupMinutes: clampInt(value.replayWarmupMinutes, 7, 0, 1440),
       replayFullBackfill: value.replayFullBackfill === true,
+      replayCacheMaxGigabytes: clampInt(
+        value.replayCacheMaxGigabytes,
+        8,
+        1,
+        1024,
+      ),
+      replayCacheMinimumFreeGigabytes: clampInt(
+        value.replayCacheMinimumFreeGigabytes,
+        4,
+        0,
+        1024,
+      ),
       includePaths: normalizeIncludePaths(value.includePaths),
       statusRefreshSeconds: clampInt(value.statusRefreshSeconds, 2, 1, 60),
     };
@@ -2121,43 +2168,51 @@ module.exports = function ajrmMarineLogger(app) {
   }
 
   async function loadPlayback(fileName, kind, playbackOptions = {}) {
-    stopPlayback("loading");
-    const normalizedKind = kind ? normalizeRecordingKind(kind) : null;
-    if (normalizedKind === "voyages") {
-      const preparedVoyage = await prepareVoyagePlayback(fileName, {
-        includeFullBackfill:
-          playbackOptions.includeFullBackfill === true || options.replayFullBackfill === true,
-      });
+    if (replayCacheMaintenancePromise) {
+      await replayCacheMaintenancePromise.catch(() => {});
+    }
+    replayCacheLoadInProgress = true;
+    try {
+      stopPlayback("loading");
+      const normalizedKind = kind ? normalizeRecordingKind(kind) : null;
+      if (normalizedKind === "voyages") {
+        const preparedVoyage = await prepareVoyagePlayback(fileName, {
+          includeFullBackfill:
+            playbackOptions.includeFullBackfill === true || options.replayFullBackfill === true,
+        });
+        return loadPlaybackFile({
+          fileName: preparedVoyage.firstSegment.name,
+          filePath: preparedVoyage.firstSegment.filePath,
+          sourceDirectory: preparedVoyage.firstSegment.directory,
+          sourceKind: "voyages",
+          voyageFileName: fileName,
+          displayFileName: `${fileName} / ${preparedVoyage.firstSegment.name}`,
+          initialCapturedAt: preparedVoyage.initialCapturedAt,
+          voyageStartedAt: preparedVoyage.voyageStartedAt,
+          warmupStartedAt: preparedVoyage.warmupStartedAt,
+          includeFullBackfill: preparedVoyage.includeFullBackfill,
+          mode: playbackOptions.mode,
+          sensorSourceIds: playbackOptions.sensorSourceIds,
+          sensorSourcePrefixes: playbackOptions.sensorSourcePrefixes,
+          initialSourceCatalog: preparedVoyage.sourceCatalog,
+          preparedSegments: preparedVoyage.segments,
+          preparedComplete: true,
+        });
+      }
+      const filePath = await resolveCaptureOrClip(fileName, normalizedKind);
       return loadPlaybackFile({
-        fileName: preparedVoyage.firstSegment.name,
-        filePath: preparedVoyage.firstSegment.filePath,
-        sourceDirectory: preparedVoyage.firstSegment.directory,
-        sourceKind: "voyages",
-        voyageFileName: fileName,
-        displayFileName: `${fileName} / ${preparedVoyage.firstSegment.name}`,
-        initialCapturedAt: preparedVoyage.initialCapturedAt,
-        voyageStartedAt: preparedVoyage.voyageStartedAt,
-        warmupStartedAt: preparedVoyage.warmupStartedAt,
-        includeFullBackfill: preparedVoyage.includeFullBackfill,
+        fileName,
+        filePath,
+        sourceDirectory: path.dirname(filePath),
+        sourceKind: normalizedKind || recordingKindForPath(filePath),
+        displayFileName: fileName,
         mode: playbackOptions.mode,
         sensorSourceIds: playbackOptions.sensorSourceIds,
         sensorSourcePrefixes: playbackOptions.sensorSourcePrefixes,
-        initialSourceCatalog: preparedVoyage.sourceCatalog,
-        preparedSegments: preparedVoyage.segments,
-        preparedComplete: true,
       });
+    } finally {
+      replayCacheLoadInProgress = false;
     }
-    const filePath = await resolveCaptureOrClip(fileName, normalizedKind);
-    return loadPlaybackFile({
-      fileName,
-      filePath,
-      sourceDirectory: path.dirname(filePath),
-      sourceKind: normalizedKind || recordingKindForPath(filePath),
-      displayFileName: fileName,
-      mode: playbackOptions.mode,
-      sensorSourceIds: playbackOptions.sensorSourceIds,
-      sensorSourcePrefixes: playbackOptions.sensorSourcePrefixes,
-    });
   }
 
   function startPlaybackLoadJob(fileName, kind, playbackOptions = {}) {
@@ -2314,21 +2369,40 @@ module.exports = function ajrmMarineLogger(app) {
     const playbackFilePath = isCompressedLogName(filePath)
       ? await materializeCompressedPlaybackFile(filePath)
       : filePath;
+    const statsInfo = await fs.promises.stat(playbackFilePath).catch(() => null);
+    const cachedReplayIndex =
+      !metadata && statsInfo?.isFile() && isReplayCachePath(playbackFilePath)
+        ? await readReplayIndexFile(playbackFilePath, statsInfo)
+        : null;
     if (typeof app.ajrmMarineLoggerTestHooks?.beforePreparePlaybackSegment === "function") {
       await app.ajrmMarineLoggerTestHooks.beforePreparePlaybackSegment({
         name: name || path.basename(playbackFilePath),
         filePath: playbackFilePath,
+        replayIndexCacheHit: Boolean(cachedReplayIndex),
       });
     }
-    const segmentMetadata = metadata || await scanFile(
-      playbackFilePath,
-      Infinity,
-      true,
-      true,
-    );
-    const statsInfo = await fs.promises.stat(playbackFilePath).catch(() => null);
+    const segmentMetadata =
+      metadata ||
+      cachedReplayIndex ||
+      await scanFile(
+        playbackFilePath,
+        Infinity,
+        true,
+        true,
+      );
     if (statsInfo?.isFile()) {
       await writeRecordingMetadataFile(playbackFilePath, statsInfo, segmentMetadata);
+      if (
+        !metadata &&
+        !cachedReplayIndex &&
+        isReplayCachePath(playbackFilePath)
+      ) {
+        await writeReplayIndexFile(
+          playbackFilePath,
+          statsInfo,
+          segmentMetadata,
+        );
+      }
     }
     return {
       name: name || path.basename(playbackFilePath),
@@ -2346,6 +2420,90 @@ module.exports = function ajrmMarineLogger(app) {
       sourceCatalog: segmentMetadata.sourceCatalog || {},
       baseCursor: 0,
     };
+  }
+
+  function isReplayCachePath(filePath) {
+    const relative = path.relative(paths.voyageReplay, filePath);
+    return Boolean(
+      relative &&
+      relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(relative),
+    );
+  }
+
+  function replayIndexPath(filePath) {
+    return `${filePath}.replay-index.json`;
+  }
+
+  async function readReplayIndexFile(filePath, statsInfo) {
+    try {
+      const indexPath = replayIndexPath(filePath);
+      const parsed = JSON.parse(await fs.promises.readFile(indexPath, "utf8"));
+      if (parsed?.version !== REPLAY_INDEX_VERSION) return null;
+      if (parsed.fileName !== path.basename(filePath)) return null;
+      if (Number(parsed.bytes) !== Number(statsInfo.size)) return null;
+      if (Math.abs(Number(parsed.mtimeMs) - Number(statsInfo.mtimeMs)) > 1) {
+        return null;
+      }
+      if (!Number.isFinite(parsed.lines) || parsed.lines < 0) return null;
+      if (!Array.isArray(parsed.offsets) || !Array.isArray(parsed.times)) {
+        return null;
+      }
+      if (
+        parsed.offsets.length !== parsed.lines ||
+        parsed.times.length !== parsed.lines
+      ) {
+        return null;
+      }
+      await touchPath(indexPath);
+      return {
+        lines: parsed.lines,
+        from: parsed.from || null,
+        to: parsed.to || null,
+        offsets: parsed.offsets,
+        times: parsed.times,
+        sourceCatalog:
+          parsed.sourceCatalog && typeof parsed.sourceCatalog === "object"
+            ? parsed.sourceCatalog
+            : {},
+      };
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  async function writeReplayIndexFile(filePath, statsInfo, metadata) {
+    const indexPath = replayIndexPath(filePath);
+    const temporaryPath =
+      `${indexPath}.${process.pid}.${Date.now()}.tmp`;
+    const payload = {
+      version: REPLAY_INDEX_VERSION,
+      fileName: path.basename(filePath),
+      bytes: statsInfo.size,
+      mtimeMs: statsInfo.mtimeMs,
+      lines: Number(metadata.lines || 0),
+      from: metadata.from || null,
+      to: metadata.to || null,
+      offsets: Array.isArray(metadata.offsets) ? metadata.offsets : [],
+      times: Array.isArray(metadata.times) ? metadata.times : [],
+      sourceCatalog: metadata.sourceCatalog || {},
+      generatedAt: new Date().toISOString(),
+    };
+    try {
+      await fs.promises.writeFile(
+        temporaryPath,
+        `${JSON.stringify(payload)}\n`,
+      );
+      await fs.promises.rename(temporaryPath, indexPath);
+    } finally {
+      await fs.promises.unlink(temporaryPath).catch(() => {});
+    }
+  }
+
+  async function touchPath(filePath) {
+    const now = new Date();
+    await fs.promises.utimes(filePath, now, now).catch(() => {});
   }
 
   function indexPlaybackSegments(segments) {
@@ -2439,40 +2597,203 @@ module.exports = function ajrmMarineLogger(app) {
     const baseName = safeReplayDirectoryName(path.basename(compressedPath).replace(/\.gz$/i, ""));
     const cacheName = `${baseName}.${statsInfo.size}.${Math.round(statsInfo.mtimeMs)}.jsonl`;
     const cachePath = path.join(cacheDirectory, cacheName);
+    const protectedPaths = activeReplayCacheProtectedPaths([cachePath]);
+    await enforceReplayCacheLimits(protectedPaths);
     const existing = await fs.promises.stat(cachePath).catch(() => null);
-    if (existing?.isFile() && existing.size > 0) return cachePath;
+    if (existing?.isFile() && existing.size > 0) {
+      await touchPath(cachePath);
+      await touchPath(replayIndexPath(cachePath));
+      return cachePath;
+    }
 
     const temporaryPath = `${cachePath}.${process.pid}.${Date.now()}.tmp`;
-    await pipeline(
-      fs.createReadStream(compressedPath),
-      zlib.createGunzip(),
-      fs.createWriteStream(temporaryPath),
-    );
-    await fs.promises.rename(temporaryPath, cachePath);
-    await pruneCompressedPlaybackCache(
-      cacheDirectory,
-      compressedPlaybackCacheKeepPaths(cachePath),
+    try {
+      await pipeline(
+        fs.createReadStream(compressedPath),
+        zlib.createGunzip(),
+        fs.createWriteStream(temporaryPath),
+      );
+      await fs.promises.rename(temporaryPath, cachePath);
+    } finally {
+      await fs.promises.unlink(temporaryPath).catch(() => {});
+    }
+    await enforceReplayCacheLimits(
+      activeReplayCacheProtectedPaths([cachePath]),
     );
     return cachePath;
   }
 
-  function compressedPlaybackCacheKeepPaths(currentPath) {
-    const keepPaths = new Set([path.resolve(currentPath)]);
+  function activeReplayCacheProtectedPaths(additionalPaths = []) {
+    const keepPaths = new Set(
+      additionalPaths.filter(Boolean).map((entry) => path.resolve(entry)),
+    );
     for (const segment of playback.segments || []) {
       if (!segment?.filePath) continue;
       keepPaths.add(path.resolve(segment.filePath));
     }
-    return keepPaths;
+    return [...keepPaths];
   }
 
-  async function pruneCompressedPlaybackCache(cacheDirectory, keepPaths) {
-    const files = await fs.promises.readdir(cacheDirectory).catch(() => []);
-    await Promise.all(files
-      .filter((name) =>
-        name.endsWith(".jsonl") &&
-        !keepPaths.has(path.resolve(cacheDirectory, name)),
+  function requestReplayCacheMaintenance() {
+    if (replayCacheLoadInProgress) return replayCacheMaintenancePromise;
+    if (replayCacheMaintenancePromise) return replayCacheMaintenancePromise;
+    lastReplayCacheMaintenanceMs = Date.now();
+    replayCacheMaintenancePromise = enforceReplayCacheLimits(
+      activeReplayCacheProtectedPaths(),
+    )
+      .catch((error) => {
+        app.debug?.(`[${plugin.id}] replay cache maintenance failed: ${error.message}`);
+      })
+      .finally(() => {
+        replayCacheMaintenancePromise = null;
+      });
+    return replayCacheMaintenancePromise;
+  }
+
+  async function enforceReplayCacheLimits(protectedPaths = []) {
+    const rootPath = path.resolve(paths.voyageReplay);
+    const entries = await replayCacheEntries(rootPath);
+    let totalBytes = entries.reduce(
+      (sum, entry) => sum + Number(entry.bytes || 0),
+      0,
+    );
+    const maxBytes = options.replayCacheMaxGigabytes * GIBIBYTE;
+    const minimumFreeBytes =
+      options.replayCacheMinimumFreeGigabytes * GIBIBYTE;
+    const disk = await readDiskStatus(rootPath);
+    let availableBytes = Number(disk.availableBytes);
+    if (!Number.isFinite(availableBytes)) availableBytes = Infinity;
+    const protectedResolved = protectedPaths.map((entry) => path.resolve(entry));
+    const removable = entries
+      .filter((entry) =>
+        !protectedResolved.some((protectedPath) =>
+          replayCacheEntryContains(entry.path, protectedPath),
+        ),
       )
-      .map((name) => fs.promises.unlink(path.join(cacheDirectory, name)).catch(() => {})));
+      .sort((left, right) =>
+        left.lastUsedMs - right.lastUsedMs ||
+        left.path.localeCompare(right.path),
+      );
+    let removedEntries = 0;
+    let removedBytes = 0;
+    while (
+      removable.length &&
+      (totalBytes > maxBytes || availableBytes < minimumFreeBytes)
+    ) {
+      const entry = removable.shift();
+      await removeReplayCacheEntry(rootPath, entry);
+      totalBytes = Math.max(0, totalBytes - entry.bytes);
+      availableBytes += entry.bytes;
+      removedEntries += 1;
+      removedBytes += entry.bytes;
+    }
+    if (removedEntries) {
+      addEvent(
+        "replay-cache-pruned",
+        `Removed ${removedEntries} inactive replay cache entr${removedEntries === 1 ? "y" : "ies"} (${formatBytes(removedBytes)})`,
+      );
+    }
+    replayCacheStatus = {
+      entries: entries.length - removedEntries,
+      bytes: totalBytes,
+      maxBytes,
+      minimumFreeBytes,
+      availableBytes,
+      removedEntries,
+      removedBytes,
+      updatedAt: new Date().toISOString(),
+    };
+    return replayCacheStatus;
+  }
+
+  function replayCacheEntryContains(entryPath, protectedPath) {
+    if (entryPath === protectedPath) return true;
+    const relative = path.relative(entryPath, protectedPath);
+    return Boolean(
+      relative &&
+      relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(relative),
+    );
+  }
+
+  async function replayCacheEntries(rootPath) {
+    const directoryEntries = await fs.promises.readdir(
+      rootPath,
+      { withFileTypes: true },
+    ).catch(() => []);
+    const result = [];
+    for (const entry of directoryEntries) {
+      const entryPath = path.join(rootPath, entry.name);
+      if (entry.isDirectory() && entry.name === "compressed-captures") {
+        const compressedFiles = await fs.promises.readdir(entryPath).catch(() => []);
+        for (const name of compressedFiles.filter((value) => value.endsWith(".jsonl"))) {
+          const filePath = path.join(entryPath, name);
+          const relatedPaths = [
+            filePath,
+            recordingMetadataPath(filePath),
+            replayIndexPath(filePath),
+          ];
+          const relatedStats = await Promise.all(
+            relatedPaths.map((candidate) =>
+              fs.promises.stat(candidate).catch(() => null),
+            ),
+          );
+          result.push({
+            path: filePath,
+            relatedPaths,
+            bytes: relatedStats.reduce(
+              (sum, info) => sum + Number(info?.size || 0),
+              0,
+            ),
+            lastUsedMs: Math.max(
+              ...relatedStats.map((info) => Number(info?.mtimeMs || 0)),
+            ),
+          });
+        }
+        continue;
+      }
+      if (!entry.isDirectory()) continue;
+      const markerStats = await fs.promises.stat(
+        voyageReplayCacheManifestPath(entryPath),
+      ).catch(() => null);
+      const entryStats = await fs.promises.stat(entryPath).catch(() => null);
+      result.push({
+        path: entryPath,
+        relatedPaths: [entryPath],
+        bytes: await recursivePathSize(entryPath),
+        lastUsedMs: Number(markerStats?.mtimeMs || entryStats?.mtimeMs || 0),
+      });
+    }
+    return result;
+  }
+
+  async function recursivePathSize(targetPath) {
+    const info = await fs.promises.lstat(targetPath).catch(() => null);
+    if (!info) return 0;
+    if (!info.isDirectory()) return Number(info.size || 0);
+    const entries = await fs.promises.readdir(
+      targetPath,
+      { withFileTypes: true },
+    ).catch(() => []);
+    let bytes = Number(info.size || 0);
+    for (const entry of entries) {
+      bytes += await recursivePathSize(path.join(targetPath, entry.name));
+    }
+    return bytes;
+  }
+
+  async function removeReplayCacheEntry(rootPath, entry) {
+    const resolved = path.resolve(entry.path);
+    if (
+      resolved === rootPath ||
+      !resolved.startsWith(`${rootPath}${path.sep}`)
+    ) {
+      throw new Error(`Refusing to remove replay cache path outside ${rootPath}`);
+    }
+    for (const targetPath of entry.relatedPaths || [resolved]) {
+      await fs.promises.rm(targetPath, { recursive: true, force: true });
+    }
   }
 
   async function prepareVoyagePlayback(fileName, playbackOptions = {}) {
@@ -2487,22 +2808,45 @@ module.exports = function ajrmMarineLogger(app) {
     const index = await readVoyageZipIndex(sourcePath);
 
     const replayDirectory = path.join(paths.voyageReplay, safeReplayDirectoryName(fileName));
-    await fs.promises.rm(replayDirectory, { recursive: true, force: true });
-    await fs.promises.mkdir(replayDirectory, { recursive: true });
-    try {
-      extractZipToDirectory(sourcePath, replayDirectory);
-    } catch (error) {
-      throw new Error(`Unable to extract voyage ${fileName}: ${error.message || error}`);
+    await enforceReplayCacheLimits([replayDirectory]);
+    let reused = await voyageReplayCacheMatches(
+      replayDirectory,
+      fileName,
+      statsInfo,
+    );
+    if (!reused) {
+      await rebuildVoyageReplayCache({
+        sourcePath,
+        fileName,
+        replayDirectory,
+        sourceStats: statsInfo,
+      });
+    } else {
+      await touchPath(voyageReplayCacheManifestPath(replayDirectory));
+      addEvent("replay-cache-hit", `Reused cached voyage ${fileName}`);
     }
 
-    const captureDirectory = path.join(replayDirectory, "capture");
-    const directory = (await directoryExists(captureDirectory)) ? captureDirectory : replayDirectory;
+    let captureDirectory = path.join(replayDirectory, "capture");
+    let directory =
+      (await directoryExists(captureDirectory))
+        ? captureDirectory
+        : replayDirectory;
     let segments = await listRecordingFiles(directory);
-    if (!segments.length) {
-      await linkReferencedVoyageSegments(sourcePath, fileName, directory);
+    if (!segments.length && reused) {
+      reused = false;
+      await rebuildVoyageReplayCache({
+        sourcePath,
+        fileName,
+        replayDirectory,
+        sourceStats: statsInfo,
+      });
+      captureDirectory = path.join(replayDirectory, "capture");
+      directory =
+        (await directoryExists(captureDirectory))
+          ? captureDirectory
+          : replayDirectory;
+      segments = await listRecordingFiles(directory);
     }
-    await materializeCompressedReplaySegments(directory);
-    segments = await listRecordingFiles(directory);
     if (!segments.length) {
       throw new Error(`Voyage ${fileName} does not contain any AJRM Marine Logger recording segments`);
     }
@@ -2526,6 +2870,10 @@ module.exports = function ajrmMarineLogger(app) {
       left.name.localeCompare(right.name),
     );
     indexPlaybackSegments(entries);
+    await enforceReplayCacheLimits([
+      replayDirectory,
+      ...entries.map((entry) => entry.filePath),
+    ]);
     const includeFullBackfill = playbackOptions.includeFullBackfill === true;
     const warmupStartedAt = includeFullBackfill
       ? null
@@ -2546,6 +2894,71 @@ module.exports = function ajrmMarineLogger(app) {
       includeFullBackfill,
       sourceCatalog,
     };
+  }
+
+  function voyageReplayCacheManifestPath(replayDirectory) {
+    return path.join(replayDirectory, ".ajrm-replay-cache.json");
+  }
+
+  async function voyageReplayCacheMatches(
+    replayDirectory,
+    fileName,
+    sourceStats,
+  ) {
+    try {
+      const parsed = JSON.parse(await fs.promises.readFile(
+        voyageReplayCacheManifestPath(replayDirectory),
+        "utf8",
+      ));
+      return (
+        parsed?.version === REPLAY_CACHE_MANIFEST_VERSION &&
+        parsed.sourceFileName === fileName &&
+        Number(parsed.sourceBytes) === Number(sourceStats.size) &&
+        Math.abs(Number(parsed.sourceMtimeMs) - Number(sourceStats.mtimeMs)) <= 1 &&
+        Math.abs(Number(parsed.sourceCtimeMs) - Number(sourceStats.ctimeMs)) <= 1
+      );
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  async function rebuildVoyageReplayCache({
+    sourcePath,
+    fileName,
+    replayDirectory,
+    sourceStats,
+  }) {
+    await fs.promises.rm(replayDirectory, { recursive: true, force: true });
+    await fs.promises.mkdir(replayDirectory, { recursive: true });
+    try {
+      extractZipToDirectory(sourcePath, replayDirectory);
+    } catch (error) {
+      throw new Error(`Unable to extract voyage ${fileName}: ${error.message || error}`);
+    }
+    const captureDirectory = path.join(replayDirectory, "capture");
+    const directory =
+      (await directoryExists(captureDirectory))
+        ? captureDirectory
+        : replayDirectory;
+    let segments = await listRecordingFiles(directory);
+    if (!segments.length) {
+      await linkReferencedVoyageSegments(sourcePath, fileName, directory);
+    }
+    await materializeCompressedReplaySegments(directory);
+    segments = await listRecordingFiles(directory);
+    if (!segments.length) return;
+    await fs.promises.writeFile(
+      voyageReplayCacheManifestPath(replayDirectory),
+      `${JSON.stringify({
+        version: REPLAY_CACHE_MANIFEST_VERSION,
+        sourceFileName: fileName,
+        sourceBytes: sourceStats.size,
+        sourceMtimeMs: sourceStats.mtimeMs,
+        sourceCtimeMs: sourceStats.ctimeMs,
+        createdAt: new Date().toISOString(),
+      }, null, 2)}\n`,
+    );
+    addEvent("replay-cache-built", `Cached voyage ${fileName}`);
   }
 
   function replayWarmupStart(index, warmupMinutes) {
@@ -3241,6 +3654,7 @@ module.exports = function ajrmMarineLogger(app) {
       clips,
       voyages,
       disk,
+      replayCache: replayCacheStatus,
       stats,
       recentEvents,
     };
@@ -4440,6 +4854,14 @@ function fileSize(filePath) {
   } catch {
     return 0;
   }
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (bytes >= GIBIBYTE) return `${(bytes / GIBIBYTE).toFixed(1)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${Math.max(0, Math.round(bytes))} bytes`;
 }
 
 async function readDiskStatus(directory) {

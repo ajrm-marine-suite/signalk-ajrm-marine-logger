@@ -1162,12 +1162,19 @@ test("startup compression does not overwrite a gzip published after snapshot", a
 test("voyage playback loads local reference capture segments", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-reference-voyage-"));
   const app = fakeApp();
+  const preparationEvents = [];
+  app.ajrmMarineLoggerTestHooks = {
+    beforePreparePlaybackSegment(event) {
+      preparationEvents.push(event);
+    },
+  };
   const routes = new Map();
   const plugin = startPlugin(app);
   plugin.registerWithRouter(routerMap(routes));
   plugin.start({
     logDirectory: root,
     autoStartCapture: false,
+    replayCacheMinimumFreeGigabytes: 1024,
   });
 
   try {
@@ -1179,6 +1186,9 @@ test("voyage playback loads local reference capture segments", async () => {
     await fs.writeFile(capturePath, zlib.gzipSync(`${JSON.stringify(envelope)}\n`));
 
     const staging = path.join(root, "voyage-stage");
+    const staleCache = path.join(root, "voyage-replay-cache", "stale-voyage");
+    await fs.mkdir(staleCache, { recursive: true });
+    await fs.writeFile(path.join(staleCache, "stale.jsonl"), "stale cache");
     await fs.mkdir(path.join(staging, "capture"), { recursive: true });
     await fs.writeFile(
       path.join(staging, "index.json"),
@@ -1209,6 +1219,67 @@ test("voyage playback loads local reference capture segments", async () => {
     assert.equal(response.body.playback.voyageFileName, "voyage-20260626T185915Z.zip");
     assert.equal(response.body.playback.fileName, captureName);
     assert.equal(response.body.playback.compressed, false);
+    await assert.rejects(fs.stat(staleCache), /ENOENT/);
+    assert.equal(preparationEvents.at(-1).replayIndexCacheHit, false);
+
+    const replayRoot = path.join(root, "voyage-replay-cache");
+    const replayDirectories = (await fs.readdir(
+      replayRoot,
+      { withFileTypes: true },
+    )).filter((entry) =>
+      entry.isDirectory() && entry.name !== "compressed-captures",
+    );
+    assert.equal(replayDirectories.length, 1);
+    const replayDirectory = path.join(replayRoot, replayDirectories[0].name);
+    const replayCapture = path.join(replayDirectory, captureName);
+    await fs.stat(`${replayCapture}.replay-index.json`);
+    const sentinelPath = path.join(replayDirectory, "cache-reuse-sentinel");
+    await fs.writeFile(sentinelPath, "preserved");
+
+    const secondResponse = await invoke(routes, "POST", "/playback/load", {
+      file: "voyage-20260626T185915Z.zip",
+      kind: "voyages",
+    });
+    assert.equal(secondResponse.statusCode, 200);
+    assert.equal(secondResponse.body.playback.totalLines, 1);
+    assert.equal(await fs.readFile(sentinelPath, "utf8"), "preserved");
+    assert.equal(preparationEvents.at(-1).replayIndexCacheHit, true);
+    const secondStatus = await app.ajrmMarineLoggerApi.status();
+    assert.ok(
+      secondStatus.recentEvents.some((event) =>
+        event.message === "Reused cached voyage voyage-20260626T185915Z.zip",
+      ),
+    );
+
+    await fs.writeFile(
+      path.join(staging, "index.json"),
+      `${JSON.stringify({
+        id: "voyage-20260626T185915Z",
+        comment: "source changed",
+        captureMode: "voyage",
+        captureFileMode: "reference",
+        captureFiles: [],
+        captureReferences: [
+          {
+            fileName: captureName,
+            sourcePath: path.join(capturesDir, captureName),
+            compressedSourcePath: capturePath,
+          },
+        ],
+      })}\n`,
+    );
+    await writeZip(
+      path.join(voyagesDir, "voyage-20260626T185915Z.zip"),
+      staging,
+      ["index.json"],
+    );
+    const thirdResponse = await invoke(routes, "POST", "/playback/load", {
+      file: "voyage-20260626T185915Z.zip",
+      kind: "voyages",
+    });
+    assert.equal(thirdResponse.statusCode, 200);
+    await assert.rejects(fs.stat(sentinelPath), /ENOENT/);
+    assert.equal(preparationEvents.at(-1).replayIndexCacheHit, false);
   } finally {
     plugin.stop();
   }

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.5
+
+- Reuse validated extracted voyage files and decompressed capture files when
+  their source identity is unchanged.
+- Persist complete replay indexes containing line offsets, timestamps, and
+  sensor-source catalogues so subsequent loads do not rescan every JSONL
+  record.
+- Add bounded least-recently-used cache maintenance, defaulting to an 8 GB
+  maximum cache and a 4 GB minimum free-space reserve. Loaded and active replay
+  files are protected, and source voyages/captures are never purge targets.
+- Show replay-cache size, entry count, configured limit, and free-space reserve
+  in Logger Status.
+- Verify cache reuse, replay-index reuse, source validation, active-cache
+  protection, and disk-pressure cleanup in the playback integration tests.
+
 ## 0.6.4
 
 - Retain every decompressed cache file while pre-indexing a multi-segment

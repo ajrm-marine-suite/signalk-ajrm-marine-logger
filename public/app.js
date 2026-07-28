@@ -55,6 +55,7 @@ const elements = {
   extractButton: document.getElementById("extractButton"),
   bufferStatus: document.getElementById("bufferStatus"),
   diskStatus: document.getElementById("diskStatus"),
+  replayCacheStatus: document.getElementById("replayCacheStatus"),
   statsStatus: document.getElementById("statsStatus"),
   eventList: document.getElementById("eventList"),
 };
@@ -386,6 +387,10 @@ function renderSystemStatus() {
   elements.diskStatus.textContent = disk.totalBytes
     ? `${formatBytes(disk.availableBytes)} free of ${formatBytes(disk.totalBytes)}`
     : disk.error || "-";
+  const replayCache = state.replayCache || {};
+  elements.replayCacheStatus.textContent = replayCache.updatedAt
+    ? `${formatBytes(replayCache.bytes)} in ${replayCache.entries || 0} entries · limit ${formatBytes(replayCache.maxBytes)} · reserve ${formatBytes(replayCache.minimumFreeBytes)}`
+    : "Checking…";
   const stats = state.stats || {};
   elements.statsStatus.textContent = `Buffered ${stats.buffered || 0}, captured ${stats.captured || 0}, filtered ${stats.filtered || 0}, played ${stats.playbackSent || 0}, compressed ${stats.compressed || 0}, next ${stats.autoAdvanced || 0}`;
   elements.eventList.innerHTML = (state.recentEvents || [])
