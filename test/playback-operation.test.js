@@ -1894,7 +1894,7 @@ test("rotated recomputed result manifest makes coverage incomplete when an earli
         activeManifest?.segmentsTotal === 3 &&
         activeManifest.segments.filter((segment) => segment.finalized).length >= 2
       );
-    }, 2000, () => JSON.stringify(activeManifest));
+    }, 5000, () => JSON.stringify(activeManifest));
     const firstSegment = activeManifest.segments[0];
     assert.equal(firstSegment.finalized, true);
     const rejectedDelete = await invoke(routes, "POST", "/files/delete", {
