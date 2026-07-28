@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.4
+
+- Retain every decompressed cache file while pre-indexing a multi-segment
+  compressed replay. Cache pruning now protects the current file and all
+  prepared segments, preventing recomputed playback from failing at cursor zero
+  after its first segment was deleted from the replay cache.
+- Add a regression test that pre-indexes and replays multiple gzip capture
+  segments through completion.
+
 ## 0.6.3
 
 - Restrict startup cleanup and compression to an immutable snapshot of files

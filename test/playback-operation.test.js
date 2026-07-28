@@ -535,6 +535,84 @@ test("clip extraction reads gzipped capture segments", async () => {
   }
 });
 
+test("recomputed replay retains every pre-indexed compressed capture cache file", async () => {
+  const root = await fs.mkdtemp(path.join(
+    os.tmpdir(),
+    "ajrm-marine-logger-compressed-playlist-",
+  ));
+  const app = fakeApp();
+  const routes = new Map();
+  const plugin = startPlugin(app);
+  plugin.registerWithRouter(routerMap(routes));
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+    autoAdvancePlayback: true,
+    compressCompletedCaptures: false,
+  });
+
+  try {
+    const capturesDir = path.join(root, "captures");
+    const captures = [
+      {
+        name: "capture-2026-07-13T21-23-54-648Z.jsonl.gz",
+        envelope: sensorEnvelope("2026-07-13T21:23:54.648Z", "YDEN.2"),
+      },
+      {
+        name: "capture-2026-07-13T21-23-55-648Z.jsonl.gz",
+        envelope: sensorEnvelope(
+          "2026-07-13T21:23:54.698Z",
+          "YDEN.c078be001ca2785e",
+        ),
+      },
+    ];
+    for (const capture of captures) {
+      await fs.writeFile(
+        path.join(capturesDir, capture.name),
+        zlib.gzipSync(`${JSON.stringify(capture.envelope)}\n`),
+      );
+    }
+
+    const loaded = await invoke(routes, "POST", "/playback/load", {
+      file: captures[0].name,
+      kind: "logs",
+      mode: "sensor-sources",
+      sensorSourcePrefixes: ["YDEN"],
+    });
+    assert.equal(loaded.statusCode, 200);
+
+    const started = await invoke(
+      routes,
+      "POST",
+      "/playback/result-capture/start",
+      {},
+    );
+    assert.equal(started.statusCode, 200);
+    const ready = await app.ajrmMarineLoggerApi.status();
+    assert.equal(ready.playback.coverage.loadedSegmentsTotal, 2);
+    const cacheFiles = await fs.readdir(path.join(
+      root,
+      "voyage-replay-cache",
+      "compressed-captures",
+    ));
+    assert.equal(
+      cacheFiles.filter((name) => name.endsWith(".jsonl")).length,
+      2,
+    );
+
+    await invokeOk(routes, "POST", "/playback/play", { rate: 1 });
+    await waitFor(async () => {
+      const status = await app.ajrmMarineLoggerApi.status();
+      return status.playback.lastReason === "end of capture";
+    });
+    const completed = await app.ajrmMarineLoggerApi.status();
+    assert.equal(completed.playback.cursor, 2);
+    assert.equal(completed.playback.lastError, null);
+  } finally {
+    plugin.stop();
+  }
+});
+
 test("status reports one named metadata error for unchanged corrupt gzip and retries after replacement", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-metadata-error-"));
   const app = fakeApp();

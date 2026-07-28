@@ -2449,16 +2449,29 @@ module.exports = function ajrmMarineLogger(app) {
       fs.createWriteStream(temporaryPath),
     );
     await fs.promises.rename(temporaryPath, cachePath);
-    pruneCompressedPlaybackCache(cacheDirectory, cachePath).catch((error) => {
-      app.debug?.(`[${plugin.id}] compressed playback cache prune failed: ${error.message}`);
-    });
+    await pruneCompressedPlaybackCache(
+      cacheDirectory,
+      compressedPlaybackCacheKeepPaths(cachePath),
+    );
     return cachePath;
   }
 
-  async function pruneCompressedPlaybackCache(cacheDirectory, keepPath) {
+  function compressedPlaybackCacheKeepPaths(currentPath) {
+    const keepPaths = new Set([path.resolve(currentPath)]);
+    for (const segment of playback.segments || []) {
+      if (!segment?.filePath) continue;
+      keepPaths.add(path.resolve(segment.filePath));
+    }
+    return keepPaths;
+  }
+
+  async function pruneCompressedPlaybackCache(cacheDirectory, keepPaths) {
     const files = await fs.promises.readdir(cacheDirectory).catch(() => []);
     await Promise.all(files
-      .filter((name) => name.endsWith(".jsonl") && path.join(cacheDirectory, name) !== keepPath)
+      .filter((name) =>
+        name.endsWith(".jsonl") &&
+        !keepPaths.has(path.resolve(cacheDirectory, name)),
+      )
       .map((name) => fs.promises.unlink(path.join(cacheDirectory, name)).catch(() => {})));
   }
 
