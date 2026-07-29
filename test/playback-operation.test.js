@@ -1750,10 +1750,14 @@ test("capture backfill keeps current plugin run buffer entries", async () => {
 test("recomputed replay capture records filtered sensor input and new plugin output without backfill", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-recomputed-"));
   const app = fakeApp();
+  const delayedReplayEchoTimers = [];
   const originalHandleMessage = app.handleMessage;
   app.handleMessage = function handleMessage(pluginId, delta) {
     originalHandleMessage.call(app, pluginId, delta);
     app.signalk.emit("delta", delta);
+    delayedReplayEchoTimers.push(setTimeout(() => {
+      app.signalk.emit("delta", JSON.parse(JSON.stringify(delta)));
+    }, 5));
     const hasPosition = (delta.updates || []).some((update) =>
       (update.values || []).some((entry) => entry.path === "navigation.position"),
     );
@@ -1984,6 +1988,31 @@ test("recomputed replay capture records filtered sensor input and new plugin out
     );
     assert.equal(stopped.body.recording.replayResult.liveInputIsolation.valid, false);
     assert.equal(
+      stopped.body.recording.replayResult.liveInputIsolation
+        .delayedReplayEchoUpdatesIgnored,
+      2,
+    );
+    assert.equal(
+      stopped.body.recording.replayResult.liveInputIsolation
+        .delayedReplayEchoValuesIgnored,
+      2,
+    );
+    assert.equal(
+      stopped.body.recording.replayResult.liveInputIsolation
+        .delayedReplayEchoSources["YDEN.2"],
+      1,
+    );
+    assert.equal(
+      stopped.body.recording.replayResult.liveInputIsolation
+        .delayedReplayEchoSources["YDEN.c078be001ca2785e"],
+      1,
+    );
+    assert.equal(
+      stopped.body.recording.replayResult.liveInputIsolation.sources["YDEN.2"],
+      undefined,
+      "exact delayed replay echoes must not invalidate live-input isolation",
+    );
+    assert.equal(
       stopped.body.recording.replayResult.liveInputIsolation.sources["YDEN.99"],
       2,
     );
@@ -2005,6 +2034,7 @@ test("recomputed replay capture records filtered sensor input and new plugin out
       true,
     );
   } finally {
+    delayedReplayEchoTimers.forEach(clearTimeout);
     plugin.stop();
   }
 });

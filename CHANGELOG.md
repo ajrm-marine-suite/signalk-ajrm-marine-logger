@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.7
+
+- Retain exact fingerprints of injected replay deltas for a bounded 15-second
+  window so asynchronous Signal K delivery is not misclassified as live
+  physical input.
+- Publish separate delayed-replay-echo counters and source evidence while
+  keeping genuinely different physical deltas quarantined and isolation
+  invalid.
+
 ## 0.6.6
 
 - Read only the ZIP central directory and small `index.json` entry when listing

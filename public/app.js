@@ -335,10 +335,12 @@ function renderPlayback() {
   const unmatchedSources = playback.sourcePolicy &&
     playback.sourcePolicy.unmatchedExplicitSensorSourceIds || [];
   const isolation = playback.liveInputIsolation || {};
+  const delayedReplayEchoes =
+    isolation.delayedReplayEchoUpdatesIgnored || 0;
   const transformedDateTimes = filterStats.transformations &&
     filterStats.transformations["navigation.datetime:replace-with-replay-wall-clock"] || 0;
   elements.sourcePolicyStatus.textContent = playback.loaded
-    ? `${playback.mode === "sensor-sources" ? `Strict sensor allow-list: ${resolvedSources.join(", ") || "none resolved"}${unmatchedSources.length ? ` · NOT RECORDED: ${unmatchedSources.join(", ")}` : ""}` : "Standard"} · ${filterStats.valuesSent || 0} kept / ${filterStats.valuesExcluded || 0} excluded · ${transformedDateTimes} navigation datetime value${transformedDateTimes === 1 ? "" : "s"} refreshed · recorded catalog: ${formatSourceCatalog(sourceCatalog)}${isolation.physicalUpdatesSeen ? ` · WARNING ${isolation.physicalUpdatesSeen} live physical updates detected` : ""}`
+    ? `${playback.mode === "sensor-sources" ? `Strict sensor allow-list: ${resolvedSources.join(", ") || "none resolved"}${unmatchedSources.length ? ` · NOT RECORDED: ${unmatchedSources.join(", ")}` : ""}` : "Standard"} · ${filterStats.valuesSent || 0} kept / ${filterStats.valuesExcluded || 0} excluded · ${transformedDateTimes} navigation datetime value${transformedDateTimes === 1 ? "" : "s"} refreshed · recorded catalog: ${formatSourceCatalog(sourceCatalog)}${delayedReplayEchoes ? ` · ${delayedReplayEchoes} delayed replay echo${delayedReplayEchoes === 1 ? "" : "es"} recognised` : ""}${isolation.physicalUpdatesSeen ? ` · WARNING ${isolation.physicalUpdatesSeen} live physical updates detected` : ""}`
     : "Select a mode before loading";
   elements.resultCaptureStatus.textContent = playback.resultCapture && playback.resultCapture.active
     ? playback.lastError

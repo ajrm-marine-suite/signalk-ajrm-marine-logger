@@ -5,6 +5,11 @@
 AJRM Marine Logger is a Signal K diagnostic capture and replay plugin intended for
 AJRM Marine testing on a Signal K vessel server.
 
+Version `0.6.7` recognises exact delayed copies of Logger's own injected replay
+deltas for 15 seconds. They are reported separately as replay echoes and no
+longer invalidate live-input isolation. A genuinely different physical-source
+delta is still quarantined and marks the recomputation as contaminated.
+
 Version `0.6.6` keeps the voyage list lightweight even with multi-hundred
 megabyte bundles. Status refresh reads only ZIP directory/index metadata and
 caches unchanged results rather than loading every full bundle.
@@ -131,7 +136,7 @@ never cache-cleanup targets.
 
 ```bash
 cd ~/.signalk
-npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.6.6 --omit=dev --no-package-lock
+npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.6.7 --omit=dev --no-package-lock
 sudo systemctl restart signalk
 ```
 
@@ -198,11 +203,16 @@ The legacy `/plugins/signalk-ajrm-marine-logger/...` route still exists for comp
   segments, and returns an `aborted`/incomplete manifest without the normal
   calculation quiet-time wait.
 - Disable or disconnect live sensor inputs for a valid recomputation test.
+  Logger fingerprints each injected replay delta and recognises an exact
+  asynchronous copy for 15 seconds, covering Signal K delivery that returns
+  after the immediate injection call has completed. These delayed replay
+  echoes have separate counters and do not invalidate isolation.
   Logger quarantines physical-source deltas that arrive outside its own replay
-  injection and records their source/count as a contamination warning, but it
-  cannot prevent those live inputs from influencing other plugins before their
-  outputs are captured. Explicitly configured physical source IDs remain part
-  of this isolation check even if they did not occur in the parent recording.
+  injection fingerprint/window and records their source/count as a
+  contamination warning, but it cannot prevent those live inputs from
+  influencing other plugins before their outputs are captured. Explicitly
+  configured physical source IDs remain part of this isolation check even if
+  they did not occur in the parent recording.
 - At replay end Logger keeps the result capture open until calculated output has
   been quiet for three seconds. Each newly captured output restarts that quiet
   period, with a fifteen-second maximum, so final debounced values are retained

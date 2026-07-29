@@ -40,6 +40,7 @@ const REPLAY_CACHE_MANIFEST_VERSION = 1;
 const GIBIBYTE = 1024 ** 3;
 const REPLAY_CALCULATION_FLUSH_MS = 3000;
 const REPLAY_CALCULATION_FLUSH_MAX_MS = 15000;
+const DEFAULT_REPLAY_ECHO_WINDOW_MS = 15000;
 const MAX_VOYAGE_INDEX_BYTES = 2 * 1024 * 1024;
 const AJRM_MARINE_LOGGER_API_REGISTRY = Symbol.for("mcdonaldajr.ajrmMarineLoggerApi");
 const AJRM_MARINE_CAPTURE_API_REGISTRY = Symbol.for("mcdonaldajr.ajrmMarineCaptureApi");
@@ -59,6 +60,7 @@ module.exports = function ajrmMarineLogger(app) {
   let playback = createPlaybackState();
   let playbackLoadJob = null;
   let activeReplayInjection = null;
+  const recentReplayInjections = new Map();
   let runStartedAtMs = Date.now();
   let startupRecoveryGeneration = 0;
   let startupRecoveryPromise = Promise.resolve();
@@ -283,6 +285,7 @@ module.exports = function ajrmMarineLogger(app) {
     maintenanceTimer = null;
     statusTimer = null;
     stopPlayback("plugin stopped", { force: true });
+    recentReplayInjections.clear();
     stopRecording("plugin stopped");
     closeBuffer();
     if (app.ajrmMarineLoggerApi?.paths) delete app.ajrmMarineLoggerApi;
@@ -733,7 +736,8 @@ module.exports = function ajrmMarineLogger(app) {
 
   function onLiveDelta(delta) {
     if (!delta || typeof delta !== "object") return;
-    const replayInput = isActiveReplayInputDelta(delta);
+    const replayInputKind = classifyReplayInputDelta(delta);
+    const replayInput = Boolean(replayInputKind);
     if (
       !replayInput &&
       (delta.$source === plugin.id || delta.source?.label === plugin.id)
@@ -754,6 +758,9 @@ module.exports = function ajrmMarineLogger(app) {
     if (resultCaptureActive) {
       if (replayInput) {
         if (activeReplayInjection) activeReplayInjection.captured = true;
+        if (replayInputKind === "delayed") {
+          recordDelayedReplayEcho(playback.liveInputIsolation, delta);
+        }
         return;
       }
       const isolated = quarantinePhysicalSourceUpdates(
@@ -790,21 +797,57 @@ module.exports = function ajrmMarineLogger(app) {
     }
   }
 
-  function isActiveReplayInputDelta(delta) {
-    if (!activeReplayInjection) return false;
-    if (activeReplayInjection.delta === delta) return true;
-    return activeReplayInjection.fingerprint === replayDeltaFingerprint(delta);
+  function classifyReplayInputDelta(delta) {
+    if (activeReplayInjection) {
+      if (activeReplayInjection.delta === delta) return "active";
+      if (
+        activeReplayInjection.fingerprint === replayDeltaFingerprint(delta)
+      ) {
+        return "active";
+      }
+    }
+    const fingerprint = replayDeltaFingerprint(delta);
+    pruneRecentReplayInjections();
+    const expiresAtMs = recentReplayInjections.get(fingerprint);
+    return Number.isFinite(expiresAtMs) && expiresAtMs >= performance.now()
+      ? "delayed"
+      : null;
   }
 
   function replayDeltaFingerprint(delta) {
-    return JSON.stringify({
-      context: delta?.context || null,
-      updates: (delta?.updates || []).map((update) => ({
-        timestamp: update?.timestamp || null,
-        source: update?.$source || update?.source?.label || null,
-        paths: (update?.values || []).map((entry) => entry?.path || ""),
-      })),
-    });
+    return crypto
+      .createHash("sha256")
+      .update(JSON.stringify({
+        context: delta?.context || null,
+        updates: (delta?.updates || []).map((update) => ({
+          timestamp: update?.timestamp || null,
+          source: update?.$source || update?.source?.label || null,
+          values: (update?.values || []).map((entry) => ({
+            path: entry?.path || "",
+            value: entry?.value,
+          })),
+        })),
+      }))
+      .digest("hex");
+  }
+
+  function rememberReplayInjection(fingerprint) {
+    pruneRecentReplayInjections();
+    const configuredMs = Number(
+      app.ajrmMarineLoggerTestHooks?.replayEchoWindowMs,
+    );
+    const windowMs =
+      Number.isFinite(configuredMs) && configuredMs >= 0
+        ? configuredMs
+        : DEFAULT_REPLAY_ECHO_WINDOW_MS;
+    recentReplayInjections.set(fingerprint, performance.now() + windowMs);
+  }
+
+  function pruneRecentReplayInjections() {
+    const nowMs = performance.now();
+    for (const [fingerprint, expiresAtMs] of recentReplayInjections) {
+      if (expiresAtMs < nowMs) recentReplayInjections.delete(fingerprint);
+    }
   }
 
   function handlePowerIntent(delta) {
@@ -967,6 +1010,7 @@ module.exports = function ajrmMarineLogger(app) {
     };
     playback.filterStats = createFilterStats();
     playback.liveInputIsolation = createLiveInputIsolation();
+    recentReplayInjections.clear();
     resetCalculationFlush();
     const result = await startRecording(0, {
       kind: "recomputed-replay",
@@ -3327,6 +3371,7 @@ module.exports = function ajrmMarineLogger(app) {
           fingerprint: replayDeltaFingerprint(replayDelta),
           captured: false,
         };
+        rememberReplayInjection(activeReplayInjection.fingerprint);
         try {
           app.handleMessage(plugin.id, replayDelta);
         } finally {
@@ -4793,9 +4838,26 @@ function createLiveInputIsolation() {
     physicalUpdatesSeen: 0,
     physicalValuesSeen: 0,
     sources: {},
+    delayedReplayEchoUpdatesIgnored: 0,
+    delayedReplayEchoValuesIgnored: 0,
+    delayedReplayEchoSources: {},
     warning:
-      "Disable or disconnect live sensor inputs during replay. Quarantine keeps detected physical deltas out of the child log, but cannot stop them influencing live calculations before capture.",
+      "Disable or disconnect live sensor inputs during replay. Exact delayed echoes of injected replay data are identified separately; other physical deltas are quarantined from the child log but may influence live calculations before capture.",
   };
+}
+
+function recordDelayedReplayEcho(isolation, delta) {
+  if (!isolation) return;
+  for (const update of delta?.updates || []) {
+    const sourceId = sourceIdentityForUpdate(delta, update) || "(missing)";
+    const valueCount = Array.isArray(update?.values) ? update.values.length : 0;
+    isolation.delayedReplayEchoUpdatesIgnored =
+      Number(isolation.delayedReplayEchoUpdatesIgnored || 0) + 1;
+    isolation.delayedReplayEchoValuesIgnored =
+      Number(isolation.delayedReplayEchoValuesIgnored || 0) + valueCount;
+    isolation.delayedReplayEchoSources[sourceId] =
+      Number(isolation.delayedReplayEchoSources[sourceId] || 0) + valueCount;
+  }
 }
 
 function quarantinePhysicalSourceUpdates(delta, policy) {
