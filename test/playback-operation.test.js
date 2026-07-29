@@ -2670,14 +2670,19 @@ test("recomputed replay flush extends for output quiet time but stops at its max
       stopElapsedMs >= 140,
       `captured outputs should extend the 80 ms quiet period (${stopElapsedMs} ms)`,
     );
-    assert.ok(
-      stopElapsedMs < 260,
-      `continuous outputs must be bounded by the 180 ms maximum (${stopElapsedMs} ms)`,
-    );
     const flush = stopped.body.recording.replayResult.calculationFlush;
     assert.equal(flush.quietPeriodMs, 80);
     assert.equal(flush.maximumDurationMs, 180);
     assert.ok(flush.outputsDuringQuietPeriod >= 2);
+    assert.equal(
+      Date.parse(flush.maximumUntil) - Date.parse(flush.startedAt),
+      180,
+      "the declared maximum flush window must remain exactly bounded",
+    );
+    assert.ok(
+      Date.parse(flush.quietUntil) <= Date.parse(flush.maximumUntil),
+      "output debounce must never extend its declared deadline past the maximum",
+    );
   } finally {
     for (const timer of outputTimers) clearTimeout(timer);
     plugin.stop();

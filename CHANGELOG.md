@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.8
+
+- Verify the replay calculation-flush maximum from Logger's declared
+  timestamps instead of imposing an unrealistically tight host wall-clock
+  limit under slower armv7 emulation.
+
 ## 0.6.7
 
 - Retain exact fingerprints of injected replay deltas for a bounded 15-second
