@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.6
+
+- Read only the ZIP central directory and small `index.json` entry when listing
+  voyage bundles instead of loading each complete bundle into the Signal K
+  event loop.
+- Cache voyage-list metadata by file size and modification time so normal
+  two-second status refreshes do not reopen unchanged bundles.
+
 ## 0.6.5
 
 - Reuse validated extracted voyage files and decompressed capture files when

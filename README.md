@@ -5,6 +5,10 @@
 AJRM Marine Logger is a Signal K diagnostic capture and replay plugin intended for
 AJRM Marine testing on a Signal K vessel server.
 
+Version `0.6.6` keeps the voyage list lightweight even with multi-hundred
+megabyte bundles. Status refresh reads only ZIP directory/index metadata and
+caches unchanged results rather than loading every full bundle.
+
 Logger now has two explicit playback modes:
 
 - **Standard replay** keeps the previous behaviour: it republishes recorded
@@ -127,7 +131,7 @@ never cache-cleanup targets.
 
 ```bash
 cd ~/.signalk
-npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.6.5 --omit=dev --no-package-lock
+npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.6.6 --omit=dev --no-package-lock
 sudo systemctl restart signalk
 ```
 

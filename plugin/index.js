@@ -10,6 +10,7 @@ const util = require("node:util");
 const zlib = require("node:zlib");
 const { pipeline } = require("node:stream/promises");
 const AdmZip = require("adm-zip");
+const yauzl = require("yauzl");
 const packageInfo = require("../package.json");
 const { createPlaybackOperation } = require("./playback-operation");
 const {
@@ -39,6 +40,7 @@ const REPLAY_CACHE_MANIFEST_VERSION = 1;
 const GIBIBYTE = 1024 ** 3;
 const REPLAY_CALCULATION_FLUSH_MS = 3000;
 const REPLAY_CALCULATION_FLUSH_MAX_MS = 15000;
+const MAX_VOYAGE_INDEX_BYTES = 2 * 1024 * 1024;
 const AJRM_MARINE_LOGGER_API_REGISTRY = Symbol.for("mcdonaldajr.ajrmMarineLoggerApi");
 const AJRM_MARINE_CAPTURE_API_REGISTRY = Symbol.for("mcdonaldajr.ajrmMarineCaptureApi");
 const execFile = util.promisify(childProcess.execFile);
@@ -72,6 +74,8 @@ module.exports = function ajrmMarineLogger(app) {
   };
   const playbackOperation = createPlaybackOperation();
   const recordingMetadataCache = new Map();
+  const voyageMetadataCache = new Map();
+  const voyageMetadataJobs = new Map();
   const recordingMetadataFailures = new Map();
   const recordingMetadataJobs = new Set();
   const recentEvents = [];
@@ -3677,7 +3681,7 @@ module.exports = function ajrmMarineLogger(app) {
       const fullPath = path.join(paths.voyages, entry.name);
       const info = await fs.promises.stat(fullPath).catch(() => null);
       if (!info?.isFile()) continue;
-      const index = await readVoyageZipIndex(fullPath);
+      const index = await cachedVoyageZipIndex(fullPath, info);
       result.push({
         fileName: entry.name,
         bytes: info.size,
@@ -3689,6 +3693,29 @@ module.exports = function ajrmMarineLogger(app) {
     }
     result.sort((a, b) => String(b.modifiedAt).localeCompare(String(a.modifiedAt)));
     return result;
+  }
+
+  async function cachedVoyageZipIndex(fullPath, info) {
+    const cacheKey = `${fullPath}:${info.size}:${info.mtimeMs}`;
+    if (voyageMetadataCache.has(cacheKey)) {
+      return voyageMetadataCache.get(cacheKey);
+    }
+    if (voyageMetadataJobs.has(cacheKey)) {
+      return voyageMetadataJobs.get(cacheKey);
+    }
+    for (const key of voyageMetadataCache.keys()) {
+      if (key.startsWith(`${fullPath}:`)) voyageMetadataCache.delete(key);
+    }
+    const job = readVoyageZipIndex(fullPath)
+      .then((index) => {
+        voyageMetadataCache.set(cacheKey, index);
+        return index;
+      })
+      .finally(() => {
+        voyageMetadataJobs.delete(cacheKey);
+      });
+    voyageMetadataJobs.set(cacheKey, job);
+    return job;
   }
 
   async function listRecordings(directory, listOptions = {}) {
@@ -4666,14 +4693,55 @@ async function assertSafeZipEntries(filePath, fileName) {
 }
 
 async function readVoyageZipIndex(filePath) {
-  try {
-    const zip = new AdmZip(filePath);
-    const entry = zip.getEntry("index.json");
-    if (!entry || entry.isDirectory) return null;
-    return JSON.parse(entry.getData().toString("utf8"));
-  } catch (_error) {
-    return null;
-  }
+  return new Promise((resolve) => {
+    yauzl.open(filePath, { lazyEntries: true, autoClose: true }, (openError, zip) => {
+      if (openError || !zip) {
+        resolve(null);
+        return;
+      }
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        zip.close();
+        resolve(value);
+      };
+      zip.once("error", () => finish(null));
+      zip.once("end", () => finish(null));
+      zip.on("entry", (entry) => {
+        if (
+          entry.fileName !== "index.json" ||
+          /\/$/.test(entry.fileName) ||
+          entry.uncompressedSize > MAX_VOYAGE_INDEX_BYTES
+        ) {
+          zip.readEntry();
+          return;
+        }
+        zip.openReadStream(entry, (streamError, stream) => {
+          if (streamError || !stream) {
+            finish(null);
+            return;
+          }
+          const chunks = [];
+          let bytes = 0;
+          stream.on("data", (chunk) => {
+            bytes += chunk.length;
+            if (bytes <= MAX_VOYAGE_INDEX_BYTES) chunks.push(chunk);
+            else stream.destroy(new Error("Voyage index is too large"));
+          });
+          stream.once("error", () => finish(null));
+          stream.once("end", () => {
+            try {
+              finish(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+            } catch (_error) {
+              finish(null);
+            }
+          });
+        });
+      });
+      zip.readEntry();
+    });
+  });
 }
 
 function zipEntryNames(filePath) {
