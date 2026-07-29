@@ -1747,6 +1747,51 @@ test("capture backfill keeps current plugin run buffer entries", async () => {
   }
 });
 
+test("normal sailing capture retains YDEN sensor data", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-yden-live-"));
+  const app = fakeApp();
+  const plugin = startPlugin(app);
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+    compressCompletedCaptures: false,
+  });
+
+  try {
+    const recording = await app.ajrmMarineLoggerApi.startCapture({
+      backfillMinutes: 0,
+    });
+    app.signalk.emit("delta", {
+      context: "vessels.self",
+      updates: [
+        {
+          $source: "YDEN.2",
+          timestamp: "2026-07-29T12:00:00.000Z",
+          values: [
+            {
+              path: "navigation.position",
+              value: { latitude: 55.8, longitude: -5.7 },
+            },
+          ],
+        },
+      ],
+    });
+    const stopped = await app.ajrmMarineLoggerApi.stopCapture("test complete");
+    const lines = (await fs.readFile(
+      path.join(root, "captures", stopped.fileName || recording.fileName),
+      "utf8",
+    )).trim().split("\n").map(JSON.parse);
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].delta.updates[0].$source, "YDEN.2");
+    assert.equal(
+      lines[0].delta.updates[0].values[0].path,
+      "navigation.position",
+    );
+  } finally {
+    plugin.stop();
+  }
+});
+
 test("recomputed replay capture records filtered sensor input and new plugin output without backfill", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-recomputed-"));
   const app = fakeApp();
@@ -1756,12 +1801,27 @@ test("recomputed replay capture records filtered sensor input and new plugin out
     originalHandleMessage.call(app, pluginId, delta);
     app.signalk.emit("delta", delta);
     delayedReplayEchoTimers.push(setTimeout(() => {
-      app.signalk.emit("delta", JSON.parse(JSON.stringify(delta)));
+      const delayed = JSON.parse(JSON.stringify(delta));
+      if (delayed.updates?.[0]?.values?.length > 1) {
+        delayed.updates[0].values = delayed.updates[0].values.slice(0, 1);
+      }
+      app.signalk.emit("delta", delayed);
     }, 5));
     const hasPosition = (delta.updates || []).some((update) =>
       (update.values || []).some((entry) => entry.path === "navigation.position"),
     );
     if (hasPosition) {
+      app.signalk.emit("delta", {
+        context: "vessels.self",
+        updates: [
+          {
+            $source: "YDEN.2",
+            source: { label: "YDEN", type: "NMEA2000", pgn: 128267, src: "2" },
+            timestamp: new Date(Date.now() + 1000).toISOString(),
+            values: [{ path: "navigation.depthBelowTransducer", value: 8.1 }],
+          },
+        ],
+      });
       app.signalk.emit("delta", {
         context: "vessels.self",
         updates: [
@@ -1827,6 +1887,10 @@ test("recomputed replay capture records filtered sensor input and new plugin out
                 {
                   path: "navigation.position",
                   value: { latitude: 55.8, longitude: -5.7 },
+                },
+                {
+                  path: "navigation.speedOverGround",
+                  value: 1.4,
                 },
               ],
             },
@@ -1970,7 +2034,7 @@ test("recomputed replay capture records filtered sensor input and new plugin out
       stopped.body.recording.replayResult.originalTo,
       "2026-07-16T09:04:13.000Z",
     );
-    assert.equal(stopped.body.recording.replayResult.sourceFilterStats.valuesSent, 2);
+    assert.equal(stopped.body.recording.replayResult.sourceFilterStats.valuesSent, 3);
     assert.equal(stopped.body.recording.replayResult.sourceFilterStats.valuesExcluded, 2);
     assert.equal(stopped.body.recording.replayResult.rate, 1);
     assert.equal(stopped.body.recording.replayResult.coverage.complete, true);
@@ -2009,8 +2073,14 @@ test("recomputed replay capture records filtered sensor input and new plugin out
     );
     assert.equal(
       stopped.body.recording.replayResult.liveInputIsolation.sources["YDEN.2"],
-      undefined,
-      "exact delayed replay echoes must not invalidate live-input isolation",
+      2,
+      "genuinely new YDEN updates must remain quarantined while replay subsets are ignored",
+    );
+    assert.equal(
+      stopped.body.recording.replayResult.liveInputIsolation
+        .unmatchedPhysicalSamples.filter((sample) => sample.source === "YDEN.2")
+        .length,
+      2,
     );
     assert.equal(
       stopped.body.recording.replayResult.liveInputIsolation.sources["YDEN.99"],

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.9
+
+- Recognise timestamped Signal K subsets and rebatched copies of injected
+  replay updates as replay evidence, rather than misclassifying their retained
+  physical source label as new live YDEN traffic.
+- Keep genuinely new physical updates quarantined during recomputed replay and
+  include bounded source, timestamp, PGN, and path samples when isolation is
+  invalid.
+- Add an explicit regression check that ordinary sailing capture always
+  retains YDEN sensor data; replay isolation remains confined to an armed
+  recomputed-result capture.
+
 ## 0.6.8
 
 - Verify the replay calculation-flush maximum from Logger's declared

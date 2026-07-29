@@ -61,6 +61,7 @@ module.exports = function ajrmMarineLogger(app) {
   let playbackLoadJob = null;
   let activeReplayInjection = null;
   const recentReplayInjections = new Map();
+  const recentReplayUpdateEvidence = new Map();
   let runStartedAtMs = Date.now();
   let startupRecoveryGeneration = 0;
   let startupRecoveryPromise = Promise.resolve();
@@ -286,6 +287,7 @@ module.exports = function ajrmMarineLogger(app) {
     statusTimer = null;
     stopPlayback("plugin stopped", { force: true });
     recentReplayInjections.clear();
+    recentReplayUpdateEvidence.clear();
     stopRecording("plugin stopped");
     closeBuffer();
     if (app.ajrmMarineLoggerApi?.paths) delete app.ajrmMarineLoggerApi;
@@ -805,13 +807,17 @@ module.exports = function ajrmMarineLogger(app) {
       ) {
         return "active";
       }
+      if (replayDeltaMatchesInjection(delta, activeReplayInjection.delta)) {
+        return "active";
+      }
     }
     const fingerprint = replayDeltaFingerprint(delta);
     pruneRecentReplayInjections();
     const expiresAtMs = recentReplayInjections.get(fingerprint);
-    return Number.isFinite(expiresAtMs) && expiresAtMs >= performance.now()
-      ? "delayed"
-      : null;
+    if (Number.isFinite(expiresAtMs) && expiresAtMs >= performance.now()) {
+      return "delayed";
+    }
+    return replayDeltaMatchesRecentEvidence(delta) ? "delayed" : null;
   }
 
   function replayDeltaFingerprint(delta) {
@@ -831,7 +837,7 @@ module.exports = function ajrmMarineLogger(app) {
       .digest("hex");
   }
 
-  function rememberReplayInjection(fingerprint) {
+  function rememberReplayInjection(delta) {
     pruneRecentReplayInjections();
     const configuredMs = Number(
       app.ajrmMarineLoggerTestHooks?.replayEchoWindowMs,
@@ -840,7 +846,25 @@ module.exports = function ajrmMarineLogger(app) {
       Number.isFinite(configuredMs) && configuredMs >= 0
         ? configuredMs
         : DEFAULT_REPLAY_ECHO_WINDOW_MS;
-    recentReplayInjections.set(fingerprint, performance.now() + windowMs);
+    const expiresAtMs = performance.now() + windowMs;
+    recentReplayInjections.set(replayDeltaFingerprint(delta), expiresAtMs);
+    for (const update of delta?.updates || []) {
+      const evidence = replayUpdateEvidence(delta, update);
+      if (!evidence) continue;
+      const candidates = recentReplayUpdateEvidence.get(evidence.key) || [];
+      if (!candidates.some((candidate) =>
+        replayValueFingerprintsEqual(candidate.values, evidence.values)
+      )) {
+        candidates.push({ expiresAtMs, values: evidence.values });
+      } else {
+        for (const candidate of candidates) {
+          if (replayValueFingerprintsEqual(candidate.values, evidence.values)) {
+            candidate.expiresAtMs = Math.max(candidate.expiresAtMs, expiresAtMs);
+          }
+        }
+      }
+      recentReplayUpdateEvidence.set(evidence.key, candidates);
+    }
   }
 
   function pruneRecentReplayInjections() {
@@ -848,6 +872,105 @@ module.exports = function ajrmMarineLogger(app) {
     for (const [fingerprint, expiresAtMs] of recentReplayInjections) {
       if (expiresAtMs < nowMs) recentReplayInjections.delete(fingerprint);
     }
+    for (const [key, candidates] of recentReplayUpdateEvidence) {
+      const activeCandidates = candidates.filter(
+        (candidate) => candidate.expiresAtMs >= nowMs,
+      );
+      if (activeCandidates.length) {
+        recentReplayUpdateEvidence.set(key, activeCandidates);
+      } else {
+        recentReplayUpdateEvidence.delete(key);
+      }
+    }
+  }
+
+  function replayDeltaMatchesInjection(delta, injectedDelta) {
+    const injectedByKey = new Map();
+    for (const update of injectedDelta?.updates || []) {
+      const evidence = replayUpdateEvidence(injectedDelta, update);
+      if (!evidence) continue;
+      const candidates = injectedByKey.get(evidence.key) || [];
+      candidates.push(evidence.values);
+      injectedByKey.set(evidence.key, candidates);
+    }
+    return replayDeltaMatchesEvidence(delta, (key) => injectedByKey.get(key));
+  }
+
+  function replayDeltaMatchesRecentEvidence(delta) {
+    pruneRecentReplayInjections();
+    return replayDeltaMatchesEvidence(delta, (key) =>
+      (recentReplayUpdateEvidence.get(key) || []).map(
+        (candidate) => candidate.values,
+      )
+    );
+  }
+
+  function replayDeltaMatchesEvidence(delta, candidatesForKey) {
+    const updates = Array.isArray(delta?.updates) ? delta.updates : [];
+    if (!updates.length) return false;
+    return updates.every((update) => {
+      const evidence = replayUpdateEvidence(delta, update);
+      if (!evidence) return false;
+      const candidates = candidatesForKey(evidence.key) || [];
+      return candidates.some((candidateValues) =>
+        replayValuesAreSubset(evidence.values, candidateValues)
+      );
+    });
+  }
+
+  function replayUpdateEvidence(delta, update) {
+    if (
+      !update?.timestamp ||
+      !Array.isArray(update.values) ||
+      update.values.length === 0
+    ) {
+      return null;
+    }
+    const sourceId = sourceIdentityForUpdate(delta, update);
+    if (!sourceId) return null;
+    const key = crypto
+      .createHash("sha256")
+      .update(JSON.stringify({
+        context: delta?.context || null,
+        timestamp: update.timestamp,
+        source: sourceId,
+        pgn: update?.source?.pgn ?? null,
+      }))
+      .digest("hex");
+    return {
+      key,
+      values: update.values.map(replayValueFingerprint).sort(),
+    };
+  }
+
+  function replayValueFingerprint(entry) {
+    return crypto
+      .createHash("sha256")
+      .update(JSON.stringify({
+        path: entry?.path || "",
+        value: entry?.value,
+      }))
+      .digest("hex");
+  }
+
+  function replayValuesAreSubset(received, injected) {
+    const remaining = new Map();
+    for (const fingerprint of injected) {
+      remaining.set(fingerprint, Number(remaining.get(fingerprint) || 0) + 1);
+    }
+    for (const fingerprint of received) {
+      const count = Number(remaining.get(fingerprint) || 0);
+      if (count < 1) return false;
+      remaining.set(fingerprint, count - 1);
+    }
+    return true;
+  }
+
+  function replayValueFingerprintsEqual(left, right) {
+    return (
+      left.length === right.length &&
+      left.every((fingerprint, index) => fingerprint === right[index])
+    );
   }
 
   function handlePowerIntent(delta) {
@@ -1011,6 +1134,7 @@ module.exports = function ajrmMarineLogger(app) {
     playback.filterStats = createFilterStats();
     playback.liveInputIsolation = createLiveInputIsolation();
     recentReplayInjections.clear();
+    recentReplayUpdateEvidence.clear();
     resetCalculationFlush();
     const result = await startRecording(0, {
       kind: "recomputed-replay",
@@ -3371,10 +3495,14 @@ module.exports = function ajrmMarineLogger(app) {
           fingerprint: replayDeltaFingerprint(replayDelta),
           captured: false,
         };
-        rememberReplayInjection(activeReplayInjection.fingerprint);
+        rememberReplayInjection(replayDelta);
         try {
           app.handleMessage(plugin.id, replayDelta);
         } finally {
+          // Signal K may normalise the context or source-priority-filter the
+          // values in place. Retain that post-pipeline form as replay evidence
+          // as well as the original injected form.
+          rememberReplayInjection(replayDelta);
           activeReplayInjection = null;
         }
       }
@@ -4841,8 +4969,9 @@ function createLiveInputIsolation() {
     delayedReplayEchoUpdatesIgnored: 0,
     delayedReplayEchoValuesIgnored: 0,
     delayedReplayEchoSources: {},
+    unmatchedPhysicalSamples: [],
     warning:
-      "Disable or disconnect live sensor inputs during replay. Exact delayed echoes of injected replay data are identified separately; other physical deltas are quarantined from the child log but may influence live calculations before capture.",
+      "Disable or disconnect live sensor inputs during replay. Timestamped replay echoes, including Signal K filtered/rebatched subsets, are identified separately; other physical deltas are quarantined from the child log but may influence live calculations before capture. Normal sailing capture is unaffected.",
   };
 }
 
@@ -4872,6 +5001,18 @@ function quarantinePhysicalSourceUpdates(delta, policy) {
       isolation.physicalValuesSeen += valueCount;
       isolation.sources[sourceId || "(missing)"] =
         Number(isolation.sources[sourceId || "(missing)"] || 0) + valueCount;
+      if (isolation.unmatchedPhysicalSamples.length < 12) {
+        isolation.unmatchedPhysicalSamples.push({
+          observedAt: new Date().toISOString(),
+          source: sourceId || "(missing)",
+          timestamp: update?.timestamp || null,
+          pgn: update?.source?.pgn ?? null,
+          paths: (update?.values || [])
+            .map((entry) => String(entry?.path || ""))
+            .filter(Boolean)
+            .slice(0, 12),
+        });
+      }
       isolation.valid = false;
       continue;
     }
@@ -4889,6 +5030,13 @@ function mergeLiveInputIsolation(target, addition) {
   target.physicalValuesSeen += Number(addition.physicalValuesSeen || 0);
   for (const [sourceId, count] of Object.entries(addition.sources || {})) {
     target.sources[sourceId] = Number(target.sources[sourceId] || 0) + Number(count || 0);
+  }
+  if (!Array.isArray(target.unmatchedPhysicalSamples)) {
+    target.unmatchedPhysicalSamples = [];
+  }
+  for (const sample of addition.unmatchedPhysicalSamples || []) {
+    if (target.unmatchedPhysicalSamples.length >= 12) break;
+    target.unmatchedPhysicalSamples.push(sample);
   }
   target.valid = target.physicalUpdatesSeen === 0;
   return target;
