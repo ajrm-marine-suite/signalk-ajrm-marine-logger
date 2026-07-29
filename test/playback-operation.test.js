@@ -86,6 +86,8 @@ test("voyage downloads defer to Capture portable bundle builder when available",
   assert.match(source, /kind === "voyages"/);
   assert.match(source, /logger-\$\{captureDownload\.fileName\}/);
   assert.match(source, /captureDownload\.cleanup\(\)/);
+  assert.match(source, /res\.once\("close"/);
+  assert.match(source, /responseClosed \|\| res\.destroyed/);
   assert.match(source, /cannot safely download a complete voyage bundle from Logger/);
 });
 

@@ -559,15 +559,29 @@ module.exports = function ajrmMarineLogger(app) {
 
     router.get(`${prefix}/files/:kind/:file/download`, async (req, res) => {
       let captureDownload = null;
+      let responseClosed = false;
+      const cleanupCaptureDownload = () => {
+        if (captureDownload) captureDownload.cleanup().catch(() => {});
+      };
+      res.once("close", () => {
+        responseClosed = true;
+        cleanupCaptureDownload();
+      });
       try {
         const kind = normalizeRecordingKind(req.params.kind);
         const fileName = safeBaseName(req.params.file);
         if (kind === "voyages") {
           captureDownload = await prepareCaptureVoyageDownload(fileName);
           if (captureDownload) {
-            res.download(captureDownload.path, `logger-${captureDownload.fileName}`, () => {
-              captureDownload.cleanup().catch(() => {});
-            });
+            if (responseClosed || res.destroyed) {
+              await captureDownload.cleanup();
+              return;
+            }
+            res.download(
+              captureDownload.path,
+              `logger-${captureDownload.fileName}`,
+              cleanupCaptureDownload,
+            );
             return;
           }
           throw new Error("AJRM Marine Capture portable download API is unavailable; cannot safely download a complete voyage bundle from Logger.");
@@ -580,8 +594,10 @@ module.exports = function ajrmMarineLogger(app) {
         }
         res.download(filePath, fileName);
       } catch (error) {
-        if (captureDownload) captureDownload.cleanup().catch(() => {});
-        res.status(400).json({ ok: false, error: error.message });
+        cleanupCaptureDownload();
+        if (!responseClosed && !res.destroyed && !res.headersSent) {
+          res.status(400).json({ ok: false, error: error.message });
+        }
       }
     });
 
