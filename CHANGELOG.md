@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.16
+
+- Recognise Signal K's mixed course projection delta: a fresh `courseApi`
+  update can be accompanied by the retained physical-source
+  `navigation.course.nextPoint` leaf and stamped with the `courseApi` time.
+  During recomputed replay, Logger now classifies only that explicitly paired,
+  metadata-free next-point value as a normalized route echo.
+- Continue quarantining standalone YDEN route updates and route updates that
+  retain physical PGN metadata.
+- Add regression coverage based on the exact split/rebatched shape observed in
+  the July 30 replay.
+
 ## 0.6.15
 
 - Treat the cursor immediately after the final indexed line as end-of-file

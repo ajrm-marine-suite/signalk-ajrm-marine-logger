@@ -16,10 +16,62 @@ const {
 const {
   calculatePlaybackDelayMs,
   createSourcePolicy,
+  partitionNormalizedCourseProjectionEchoes,
   replayDeltaAsLiveInputs,
   replayDeltaWithPolicy,
   shouldReplayInputPath,
 } = startPlugin._test;
+
+test("mixed courseApi projection separates retained YDEN next-point echo", () => {
+  const timestamp = "2026-07-30T18:45:13.119Z";
+  const delta = {
+    context: "vessels.urn:mrn:imo:mmsi:235008635",
+    updates: [{
+      $source: "courseApi",
+      timestamp,
+      values: [{
+        path: "navigation.course.previousPoint",
+        value: { name: "VP" },
+      }],
+    }, {
+      $source: "YDEN.2",
+      timestamp,
+      values: [{
+        path: "navigation.course.nextPoint",
+        value: { name: "DP" },
+      }],
+    }],
+  };
+  const policy = createSourcePolicy("sensor-sources", {
+    sensorSourceIds: ["YDEN.2"],
+    sensorSourcePrefixes: [],
+  }, {
+    "YDEN.2": { updates: 1, values: 1 },
+  });
+  const partitioned = partitionNormalizedCourseProjectionEchoes(delta, policy);
+  assert.deepEqual(
+    partitioned.delta.updates.map((update) => update.$source),
+    ["courseApi"],
+  );
+  assert.deepEqual(
+    partitioned.echoDelta.updates.map((update) => update.$source),
+    ["YDEN.2"],
+  );
+
+  const physicalRouteDelta = {
+    ...delta,
+    updates: [{
+      ...delta.updates[1],
+      source: { label: "YDEN", pgn: 129284, src: "2" },
+    }],
+  };
+  const physicalPartition = partitionNormalizedCourseProjectionEchoes(
+    physicalRouteDelta,
+    policy,
+  );
+  assert.equal(physicalPartition.echoDelta, null);
+  assert.equal(physicalPartition.delta.updates.length, 1);
+});
 
 test("stopping invalidates an in-flight playback operation", () => {
   const operation = createPlaybackOperation();
@@ -1885,11 +1937,26 @@ test("recomputed replay capture records filtered sensor input and new plugin out
     );
     if (nextPointUpdate) {
       delayedReplayEchoTimers.push(setTimeout(() => {
+        const normalizedAt = new Date().toISOString();
         app.signalk.emit("delta", {
           context: "vessels.self",
           updates: [
             {
+              $source: "courseApi",
+              timestamp: normalizedAt,
+              values: [{
+                path: "navigation.course.previousPoint",
+                value: {
+                  position: { latitude: 55.8, longitude: -5.7 },
+                  type: "VesselPosition",
+                  name: "VP",
+                },
+              }],
+            },
+            {
               ...JSON.parse(JSON.stringify(nextPointUpdate)),
+              timestamp: normalizedAt,
+              source: undefined,
               values: nextPointUpdate.values.filter(
                 (entry) => entry.path === "navigation.course.nextPoint",
               ),
@@ -2110,25 +2177,46 @@ test("recomputed replay capture records filtered sensor input and new plugin out
       path.join(root, "captures", stopped.body.recording.fileName),
       "utf8",
     )).trim().split("\n").map(JSON.parse);
-    assert.deepEqual(lines.map((line) => line.replayRole), [
-      "sensor-input",
-      "recomputed-output",
-      "sensor-input",
-      "recomputed-output",
-    ]);
-    assert.equal(lines[0].originalCapturedAt, "2026-07-16T09:04:12.000Z");
-    assert.equal(lines[0].delta.updates[0].$source, "YDEN.2");
-    assert.equal(lines[0].delta.updates[0].timestamp.startsWith("2026-07-16"), false);
-    assert.equal(lines[1].delta.updates[0].$source, "signalk-test-calculator");
+    const sensorInputs = lines.filter(
+      (line) => line.replayRole === "sensor-input",
+    );
+    const calculatorOutputs = lines.filter((line) =>
+      line.replayRole === "recomputed-output" &&
+      line.delta.updates.some(
+        (update) => update.$source === "signalk-test-calculator",
+      )
+    );
+    const courseApiOutputs = lines.filter((line) =>
+      line.replayRole === "recomputed-output" &&
+      line.delta.updates.some((update) => update.$source === "courseApi")
+    );
+    assert.equal(sensorInputs.length, 2);
+    assert.equal(calculatorOutputs.length, 2);
+    assert.equal(courseApiOutputs.length, 1);
+    assert.equal(sensorInputs[0].originalCapturedAt, "2026-07-16T09:04:12.000Z");
+    assert.equal(sensorInputs[0].delta.updates[0].$source, "YDEN.2");
     assert.equal(
-      lines[1].delta.updates[0].values[0].path,
+      sensorInputs[0].delta.updates[0].timestamp.startsWith("2026-07-16"),
+      false,
+    );
+    assert.equal(
+      calculatorOutputs[0].delta.updates[0].$source,
+      "signalk-test-calculator",
+    );
+    assert.equal(
+      calculatorOutputs[0].delta.updates[0].values[0].path,
       "plugins.testCalculator.result",
       "recomputed outputs must bypass the normal includePaths filter",
     );
-    assert.equal(lines[2].originalCapturedAt, "2026-07-16T09:04:13.000Z");
-    assert.equal(lines[2].delta.updates[0].$source, "YDEN.c078be001ca2785e");
+    assert.equal(sensorInputs[1].originalCapturedAt, "2026-07-16T09:04:13.000Z");
+    assert.equal(
+      sensorInputs[1].delta.updates[0].$source,
+      "YDEN.c078be001ca2785e",
+    );
     assert.ok(
-      Date.parse(lines[2].capturedAt) - Date.parse(lines[0].capturedAt) >= 800,
+      Date.parse(sensorInputs[1].capturedAt) -
+        Date.parse(sensorInputs[0].capturedAt) >=
+        800,
       "1x replay should preserve the recorded gap across capture segments",
     );
     assert.equal(stopped.body.recording.replayResult.parentVoyage, "voyage-parent.zip");

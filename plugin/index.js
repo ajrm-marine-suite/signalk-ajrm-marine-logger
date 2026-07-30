@@ -781,8 +781,19 @@ module.exports = function ajrmMarineLogger(app) {
         }
         return;
       }
-      const isolated = quarantinePhysicalSourceUpdates(
+      const routeProjection = partitionNormalizedCourseProjectionEchoes(
         delta,
+        playback.sourcePolicy,
+      );
+      if (routeProjection.echoDelta) {
+        recordDelayedReplayEcho(
+          playback.liveInputIsolation,
+          routeProjection.echoDelta,
+        );
+      }
+      if (!routeProjection.delta) return;
+      const isolated = quarantinePhysicalSourceUpdates(
+        routeProjection.delta,
         playback.sourcePolicy,
       );
       mergeLiveInputIsolation(playback.liveInputIsolation, isolated.isolation);
@@ -5090,6 +5101,49 @@ function quarantinePhysicalSourceUpdates(delta, policy) {
   };
 }
 
+function partitionNormalizedCourseProjectionEchoes(delta, policy) {
+  const updates = Array.isArray(delta?.updates) ? delta.updates : [];
+  const courseApiTimestamps = new Set(
+    updates
+      .filter((update) =>
+        sourceIdentityForUpdate(delta, update) === "courseApi" &&
+        (update.values || []).some((entry) =>
+          String(entry?.path || "").startsWith("navigation.course.")
+        )
+      )
+      .map((update) => update.timestamp)
+      .filter(Boolean),
+  );
+  if (!courseApiTimestamps.size) {
+    return { delta, echoDelta: null };
+  }
+  const retained = [];
+  const echoes = [];
+  for (const update of updates) {
+    const values = Array.isArray(update?.values) ? update.values : [];
+    const isRouteProjectionEcho =
+      sourceMatchesPhysicalPolicy(
+        sourceIdentityForUpdate(delta, update),
+        policy,
+      ) &&
+      update?.source?.pgn == null &&
+      courseApiTimestamps.has(update?.timestamp) &&
+      values.length > 0 &&
+      values.every(
+        (entry) => entry?.path === "navigation.course.nextPoint",
+      );
+    if (isRouteProjectionEcho) {
+      echoes.push(update);
+    } else {
+      retained.push(update);
+    }
+  }
+  return {
+    delta: retained.length ? { ...delta, updates: retained } : null,
+    echoDelta: echoes.length ? { ...delta, updates: echoes } : null,
+  };
+}
+
 function mergeLiveInputIsolation(target, addition) {
   if (!target || !addition) return target;
   target.physicalUpdatesSeen += Number(addition.physicalUpdatesSeen || 0);
@@ -5251,6 +5305,7 @@ async function readLineAtOffset(filePath, offset) {
 module.exports._test = {
   calculatePlaybackDelayMs,
   normalizePlaybackRate,
+  partitionNormalizedCourseProjectionEchoes,
   replayDeltaAsLiveInputs,
   replayDeltaWithPolicy,
   createSourcePolicy,
