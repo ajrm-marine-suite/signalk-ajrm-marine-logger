@@ -1865,6 +1865,7 @@ test("normal sailing capture retains YDEN sensor data", async () => {
 test("recomputed replay capture records filtered sensor input and new plugin output without backfill", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-recomputed-"));
   const app = fakeApp();
+  app.selfId = "urn:mrn:imo:mmsi:235008635";
   const delayedReplayEchoTimers = [];
   const originalHandleMessage = app.handleMessage;
   app.handleMessage = function handleMessage(pluginId, delta) {
@@ -1877,6 +1878,26 @@ test("recomputed replay capture records filtered sensor input and new plugin out
       }
       app.signalk.emit("delta", delayed);
     }, 5));
+    const nextPointUpdate = (delta.updates || []).find((update) =>
+      (update.values || []).some(
+        (entry) => entry.path === "navigation.course.nextPoint",
+      )
+    );
+    if (nextPointUpdate) {
+      delayedReplayEchoTimers.push(setTimeout(() => {
+        app.signalk.emit("delta", {
+          context: "vessels.self",
+          updates: [
+            {
+              ...JSON.parse(JSON.stringify(nextPointUpdate)),
+              values: nextPointUpdate.values.filter(
+                (entry) => entry.path === "navigation.course.nextPoint",
+              ),
+            },
+          ],
+        });
+      }, 5));
+    }
     const hasPosition = (delta.updates || []).some((update) =>
       (update.values || []).some((entry) => entry.path === "navigation.position"),
     );
@@ -1948,7 +1969,7 @@ test("recomputed replay capture records filtered sensor input and new plugin out
       `${JSON.stringify({
         capturedAt: "2026-07-16T09:04:12.000Z",
         delta: {
-          context: "vessels.self",
+          context: "vessels.urn:mrn:imo:mmsi:235008635",
           updates: [
             {
               $source: "YDEN.2",
@@ -1961,6 +1982,17 @@ test("recomputed replay capture records filtered sensor input and new plugin out
                 {
                   path: "navigation.speedOverGround",
                   value: 1.4,
+                },
+                {
+                  path: "navigation.course.nextPoint",
+                  value: {
+                    position: {
+                      latitude: 55.8084175,
+                      longitude: -5.6991992,
+                    },
+                    type: "Location",
+                    name: "DP",
+                  },
                 },
               ],
             },
@@ -2104,7 +2136,7 @@ test("recomputed replay capture records filtered sensor input and new plugin out
       stopped.body.recording.replayResult.originalTo,
       "2026-07-16T09:04:13.000Z",
     );
-    assert.equal(stopped.body.recording.replayResult.sourceFilterStats.valuesSent, 3);
+    assert.equal(stopped.body.recording.replayResult.sourceFilterStats.valuesSent, 4);
     assert.equal(stopped.body.recording.replayResult.sourceFilterStats.valuesExcluded, 2);
     assert.equal(stopped.body.recording.replayResult.rate, 1);
     assert.equal(stopped.body.recording.replayResult.coverage.complete, true);
@@ -2124,17 +2156,17 @@ test("recomputed replay capture records filtered sensor input and new plugin out
     assert.equal(
       stopped.body.recording.replayResult.liveInputIsolation
         .delayedReplayEchoUpdatesIgnored,
-      2,
+      3,
     );
     assert.equal(
       stopped.body.recording.replayResult.liveInputIsolation
         .delayedReplayEchoValuesIgnored,
-      2,
+      3,
     );
     assert.equal(
       stopped.body.recording.replayResult.liveInputIsolation
         .delayedReplayEchoSources["YDEN.2"],
-      1,
+      2,
     );
     assert.equal(
       stopped.body.recording.replayResult.liveInputIsolation
@@ -2151,6 +2183,14 @@ test("recomputed replay capture records filtered sensor input and new plugin out
         .unmatchedPhysicalSamples.filter((sample) => sample.source === "YDEN.2")
         .length,
       2,
+    );
+    assert.equal(
+      stopped.body.recording.replayResult.liveInputIsolation
+        .unmatchedPhysicalSamples.some((sample) =>
+          sample.paths.includes("navigation.course.nextPoint")
+        ),
+      false,
+      "a self-context-normalized route update must remain replay evidence",
     );
     assert.equal(
       stopped.body.recording.replayResult.liveInputIsolation.sources["YDEN.99"],

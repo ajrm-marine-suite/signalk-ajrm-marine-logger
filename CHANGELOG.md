@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.14
+
+- Treat `vessels.self` and the configured vessel's canonical Signal K context
+  as the same identity when matching replay echoes.
+- Prevent legitimate rebatching of recorded GPS route and next-waypoint data
+  from being misclassified as new live YDEN input while continuing to
+  quarantine genuinely different physical-source updates.
+- Add regression coverage based on the recorded GPS-to-tillerpilot
+  `navigation.course.nextPoint` pattern.
+
 ## 0.6.13
 
 - Re-anchor numeric playback pacing after every emitted measurement. If Signal

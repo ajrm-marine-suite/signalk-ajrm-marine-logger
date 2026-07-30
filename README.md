@@ -228,7 +228,9 @@ The legacy `/plugins/signalk-ajrm-marine-logger/...` route still exists for comp
   Logger retains timestamped source/path/value evidence for each injected
   replay update for 15 seconds. Exact asynchronous copies and Signal K
   filtered or rebatched subsets are reported separately as replay echoes and
-  do not invalidate isolation.
+  do not invalidate isolation. This matching treats `vessels.self` and the
+  configured vessel's canonical Signal K context as the same identity, so
+  recorded GPS route and next-waypoint messages remain valid replay input.
   Logger quarantines physical-source deltas that arrive outside its own replay
   evidence window and records their source/count plus bounded timestamp, PGN,
   and path samples as a contamination warning, but it cannot prevent those

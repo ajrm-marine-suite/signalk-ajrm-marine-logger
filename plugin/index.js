@@ -840,7 +840,7 @@ module.exports = function ajrmMarineLogger(app) {
     return crypto
       .createHash("sha256")
       .update(JSON.stringify({
-        context: delta?.context || null,
+        context: replayEvidenceContext(delta?.context),
         updates: (delta?.updates || []).map((update) => ({
           timestamp: update?.timestamp || null,
           source: update?.$source || update?.source?.label || null,
@@ -947,7 +947,7 @@ module.exports = function ajrmMarineLogger(app) {
     const key = crypto
       .createHash("sha256")
       .update(JSON.stringify({
-        context: delta?.context || null,
+        context: replayEvidenceContext(delta?.context),
         timestamp: update.timestamp,
         source: sourceId,
         pgn: update?.source?.pgn ?? null,
@@ -957,6 +957,21 @@ module.exports = function ajrmMarineLogger(app) {
       key,
       values: update.values.map(replayValueFingerprint).sort(),
     };
+  }
+
+  function replayEvidenceContext(context) {
+    const contextId = String(context || "").trim();
+    const selfId = String(app.selfId || "")
+      .trim()
+      .replace(/^vessels\./, "");
+    if (
+      contextId === "vessels.self" ||
+      (selfId &&
+        (contextId === selfId || contextId === `vessels.${selfId}`))
+    ) {
+      return "vessels.self";
+    }
+    return contextId || null;
   }
 
   function replayValueFingerprint(entry) {
