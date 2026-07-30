@@ -2761,6 +2761,67 @@ test("recomputed replay flush extends for output quiet time but stops at its max
   }
 });
 
+test("recomputed replay republishes an inactive flush while leaving manual ZIP finalisation available", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-flush-projection-"));
+  const app = fakeApp();
+  app.ajrmMarineLoggerTestHooks = {
+    calculationFlushQuietMs: 40,
+    calculationFlushMaxMs: 80,
+  };
+  const routes = new Map();
+  const plugin = startPlugin(app);
+  plugin.registerWithRouter(routerMap(routes));
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+    autoAdvancePlayback: false,
+    compressCompletedCaptures: false,
+  });
+
+  try {
+    const captureName = "capture-2026-07-16T11-00-00-000Z.jsonl";
+    await fs.writeFile(
+      path.join(root, "captures", captureName),
+      `${JSON.stringify(sensorEnvelope(
+        "2026-07-16T11:00:00.000Z",
+        "YDEN.2",
+      ))}\n`,
+    );
+    await invokeOk(routes, "POST", "/playback/load", {
+      file: captureName,
+      kind: "logs",
+      mode: "sensor-sources",
+      sensorSourceIds: ["YDEN.2"],
+    });
+    await invokeOk(routes, "POST", "/playback/result-capture/start", {
+      parentVoyage: "voyage-flush-parent.zip",
+    });
+    await invokeOk(routes, "POST", "/playback/play", { rate: 1 });
+    await waitFor(async () => {
+      const status = await app.ajrmMarineLoggerApi.status();
+      return status.playback.lastReason === "end of capture";
+    });
+    await waitFor(async () => {
+      const status = await app.ajrmMarineLoggerApi.status();
+      return status.playback.calculationFlushActive === false;
+    });
+
+    const status = await app.ajrmMarineLoggerApi.status();
+    assert.equal(status.playback.calculationFlushActive, false);
+    assert.equal(status.playback.resultCapture.active, true);
+    assert.equal(status.recording.kind, "recomputed-replay");
+    const clocks = app.messages.flatMap((delta) =>
+      (delta.updates || []).flatMap((update) => update.values || []),
+    ).filter((entry) => entry.path === "plugins.ajrmMarineLogger.playback");
+    const latestClock = clocks[clocks.length - 1]?.value;
+    assert.equal(latestClock.active, false);
+    assert.equal(latestClock.resultCapture, true);
+    assert.equal(latestClock.calculationFlushActive, false);
+  } finally {
+    plugin.stop();
+  }
+});
+
 test("AJRM Marine Pi Controller power intent closes active capture", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-power-intent-"));
   const app = fakeApp();

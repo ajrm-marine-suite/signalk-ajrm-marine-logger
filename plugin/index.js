@@ -1513,6 +1513,27 @@ module.exports = function ajrmMarineLogger(app) {
       Number(playback.calculationFlushMaxUntilMs),
       now + calculationFlushQuietMs(),
     );
+    scheduleCalculationFlushProjectionRefresh();
+  }
+
+  function scheduleCalculationFlushProjectionRefresh() {
+    clearTimeout(playback.calculationFlushTimer);
+    const remainingMs = calculationFlushRemainingMs();
+    if (remainingMs <= 0) {
+      playback.calculationFlushTimer = null;
+      publishPlaybackClock(false);
+      updateProviderStatus();
+      return;
+    }
+    playback.calculationFlushTimer = setTimeout(() => {
+      playback.calculationFlushTimer = null;
+      if (calculationFlushRemainingMs() > 0) {
+        scheduleCalculationFlushProjectionRefresh();
+        return;
+      }
+      publishPlaybackClock(false);
+      updateProviderStatus();
+    }, remainingMs + 5);
   }
 
   function extendCalculationFlushAfterOutput() {
@@ -1554,6 +1575,8 @@ module.exports = function ajrmMarineLogger(app) {
   }
 
   function resetCalculationFlush() {
+    clearTimeout(playback.calculationFlushTimer);
+    playback.calculationFlushTimer = null;
     playback.calculationFlushStartedAtMs = null;
     playback.calculationFlushUntilMs = null;
     playback.calculationFlushMaxUntilMs = null;
@@ -4441,6 +4464,7 @@ module.exports = function ajrmMarineLogger(app) {
       calculationFlushUntilMs: null,
       calculationFlushMaxUntilMs: null,
       calculationFlushOutputCount: 0,
+      calculationFlushTimer: null,
       originalCapturedAt: null,
       rate: 1,
       previousTs: null,

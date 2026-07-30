@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.11
+
+- Republish Logger's playback projection when the bounded recomputation
+  calculation-flush window expires, so status consumers no longer retain a
+  stale `calculationFlushActive` value after playback has completed.
+- Keep the completed recomputed capture open for the intentional manual
+  **Stop and build ZIP** workflow, and cover that distinction with a
+  regression test.
+
 ## 0.6.9
 
 - Recognise timestamped Signal K subsets and rebatched copies of injected

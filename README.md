@@ -5,6 +5,11 @@
 AJRM Marine Logger is a Signal K diagnostic capture and replay plugin intended for
 AJRM Marine testing on a Signal K vessel server.
 
+Version `0.6.11` republishes replay status when the calculation quiet-time
+window expires. The recomputed capture intentionally remains open for
+**Stop and build ZIP**, but other plugins no longer see a stale active-flush
+flag.
+
 Version `0.6.10` cleans Capture's temporary portable-voyage workspace when a
 Logger download completes, fails, or its browser connection closes during
 bundle preparation.
