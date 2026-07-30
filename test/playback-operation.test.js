@@ -65,6 +65,74 @@ test("numeric playback rate stops delaying once playback is behind schedule", ()
   );
 });
 
+test("1x playback preserves the next recorded interval after a scheduler stall", async () => {
+  const root = await fs.mkdtemp(path.join(
+    os.tmpdir(),
+    "ajrm-marine-logger-non-catching-up-replay-",
+  ));
+  const app = fakeApp();
+  const routes = new Map();
+  let pacingNowMs = 1000;
+  const injectedAt = [];
+  app.ajrmMarineLoggerTestHooks = {
+    monotonicNowMs: () => pacingNowMs,
+  };
+  app.handleMessage = (_pluginId, delta) => {
+    app.messages.push(delta);
+    const isSensorPosition = delta?.updates?.some((update) =>
+      update.$source === "YDEN.2"
+      && update.values?.some((value) => value.path === "navigation.position")
+    );
+    if (!isSensorPosition) return;
+    injectedAt.push(performance.now());
+    if (injectedAt.length === 2) {
+      // Model an event-loop stall after the second recorded measurement.
+      pacingNowMs += 500;
+    }
+  };
+  const plugin = startPlugin(app);
+  plugin.registerWithRouter(routerMap(routes));
+  plugin.start({
+    logDirectory: root,
+    autoStartCapture: false,
+    autoAdvancePlayback: false,
+    compressCompletedCaptures: false,
+  });
+
+  try {
+    const captureName = "capture-2026-07-17T13-15-00-000Z.jsonl";
+    const envelopes = [
+      sensorEnvelope("2026-07-17T13:15:00.000Z", "YDEN.2"),
+      sensorEnvelope("2026-07-17T13:15:00.010Z", "YDEN.2"),
+      sensorEnvelope("2026-07-17T13:15:00.060Z", "YDEN.2"),
+    ];
+    await fs.writeFile(
+      path.join(root, "captures", captureName),
+      `${envelopes.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+    );
+    await invokeOk(routes, "POST", "/playback/load", {
+      file: captureName,
+      kind: "logs",
+      mode: "standard",
+    });
+    await invokeOk(routes, "POST", "/playback/play", { rate: 1 });
+    await waitFor(async () => {
+      const status = await app.ajrmMarineLoggerApi.status();
+      return status.playback.lastReason === "end of capture";
+    });
+
+    assert.equal(injectedAt.length, 3);
+    assert.ok(
+      injectedAt[2] - injectedAt[1] >= 35,
+      `expected the final 50 ms recorded interval to survive the stall; observed ${
+        injectedAt[2] - injectedAt[1]
+      } ms`,
+    );
+  } finally {
+    plugin.stop();
+  }
+});
+
 test("max playback never applies timing delay", () => {
   assert.equal(
     calculatePlaybackDelayMs({

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.13
+
+- Re-anchor numeric playback pacing after every emitted measurement. If Signal
+  K or the host falls behind, the remaining replay now shifts later instead of
+  catching up in a burst and compressing recorded sensor intervals.
+- Keep the normal navigation calculations identical during live operation and
+  replay; timing fidelity is enforced by Logger rather than replay-specific
+  handling in GPS Integrity.
+- Add a regression test proving that a scheduler stall cannot collapse the
+  following recorded interval during 1x playback.
+
 ## 0.6.12
 
 - Republish Logger's playback projection when the bounded recomputation

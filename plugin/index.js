@@ -3551,13 +3551,11 @@ module.exports = function ajrmMarineLogger(app) {
       playback.lastLinePacingMs = playbackPacingNowMs();
       if (Number.isFinite(currentMs)) {
         playback.previousTs = currentMs;
-        if (
-          !Number.isFinite(playback.sourceAnchorMs) ||
-          !Number.isFinite(playback.pacingAnchorMs)
-        ) {
-          playback.sourceAnchorMs = currentMs;
-          playback.pacingAnchorMs = playback.lastLinePacingMs;
-        }
+        // Anchor pacing to the most recently emitted measurement. If Signal K
+        // or the host stalls, move the remaining replay later instead of
+        // emitting a catch-up burst that compresses recorded sensor gaps.
+        playback.sourceAnchorMs = currentMs;
+        playback.pacingAnchorMs = playback.lastLinePacingMs;
       }
       nextDelayMs = playbackDelayToTimestamp(nextPlaybackSourceMs());
       if (nextDelayMs > 0 || playbackPacingNowMs() - batchStartedMs >= 40) break;

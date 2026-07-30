@@ -5,6 +5,11 @@
 AJRM Marine Logger is a Signal K diagnostic capture and replay plugin intended for
 AJRM Marine testing on a Signal K vessel server.
 
+Version `0.6.13` preserves recorded sensor intervals during numeric playback:
+if Signal K or the host falls behind, playback slows instead of emitting a
+catch-up burst. This keeps 1x recomputation timing faithful without adding
+replay-specific branches to navigation or GPS-integrity calculations.
+
 Version `0.6.12` republishes replay status when the calculation quiet-time
 window expires. The recomputed capture intentionally remains open for
 **Stop and build ZIP**, but other plugins no longer see a stale active-flush
@@ -58,9 +63,10 @@ Version `0.5.6` makes playback act as a live input simulator: raw input paths
 are replayed with fresh Signal K timestamps, while derived `plugins.*` and
 `notifications.*` paths are not republished into the active system.
 
-Version `0.5.5` anchors numeric playback speeds to the source recording clock,
-so 10x and 20x stay throttled when the Pi has headroom but catch up instead of
-accumulating timer overhead when replay falls behind.
+Version `0.5.5` introduced source-clock pacing for numeric playback speeds.
+Version `0.6.13` makes that pacing measurement-relative: timer or processing
+delays shift the remaining replay later rather than compressing later sensor
+intervals to catch up.
 
 Version `0.5.4` adds a **Max** playback mode that uses no source-time delay and
 replays as fast as the Pi can process the deltas.
@@ -147,7 +153,7 @@ never cache-cleanup targets.
 
 ```bash
 cd ~/.signalk
-npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.6.10 --omit=dev --no-package-lock
+npm install git+https://github.com/ajrm-marine-suite/signalk-ajrm-marine-logger.git#v0.6.13 --omit=dev --no-package-lock
 sudo systemctl restart signalk
 ```
 
@@ -177,6 +183,11 @@ The legacy `/plugins/signalk-ajrm-marine-logger/...` route still exists for comp
   recomputed-replay result capture is the sole exception.
 - Playback publishes `plugins.ajrmMarineLogger.playback` as a replay clock so AJRM Marine can show an explicit replay badge and avoid guessing from stale timestamps. The value includes whether playback is active/playing, the recording time, file name, display file name, source kind, voyage name when applicable, and rate; speed changes are published dynamically while playback is running.
 - Playback injects captured raw input deltas back into Signal K with `app.handleMessage`, using fresh replay-time update timestamps and refreshed embedded source timestamps. Derived `plugins.*` and `notifications.*` paths are recorded for forensic use but are not republished during normal playback, so current apps recompute derived state from the replayed inputs.
+- Numeric playback preserves each interval relative to the previously emitted
+  recorded measurement. When the host is delayed, playback slows instead of
+  catching up in a burst; a 1x recomputed replay therefore exercises the same
+  downstream navigation and integrity code without manufacturing compressed
+  GPS intervals.
 - Replay preserves the physical `navigation.datetime` sensor path but replaces
   its historical scalar value with the same current wall-clock ISO timestamp
   used on the replayed update. This prevents Signal K's optional
