@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.11
+## 0.6.12
 
 - Republish Logger's playback projection when the bounded recomputation
   calculation-flush window expires, so status consumers no longer retain a
@@ -8,6 +8,8 @@
 - Keep the completed recomputed capture open for the intentional manual
   **Stop and build ZIP** workflow, and cover that distinction with a
   regression test.
+- Make the projection regression test wait for the republished Signal K
+  message itself, avoiding a host-timing race on loaded Linux CI runners.
 
 ## 0.6.9
 

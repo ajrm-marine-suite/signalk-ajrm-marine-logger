@@ -2801,9 +2801,15 @@ test("recomputed replay republishes an inactive flush while leaving manual ZIP f
       const status = await app.ajrmMarineLoggerApi.status();
       return status.playback.lastReason === "end of capture";
     });
-    await waitFor(async () => {
-      const status = await app.ajrmMarineLoggerApi.status();
-      return status.playback.calculationFlushActive === false;
+    await waitFor(() => {
+      const clocks = app.messages.flatMap((delta) =>
+        (delta.updates || []).flatMap((update) => update.values || []),
+      ).filter((entry) => entry.path === "plugins.ajrmMarineLogger.playback");
+      const latestClock = clocks[clocks.length - 1]?.value;
+      return latestClock?.active === false &&
+        latestClock?.resultCapture === true &&
+        latestClock?.calculationFlushUntil &&
+        latestClock?.calculationFlushActive === false;
     });
 
     const status = await app.ajrmMarineLoggerApi.status();
