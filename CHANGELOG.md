@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.15
+
+- Treat the cursor immediately after the final indexed line as end-of-file
+  instead of rescanning the whole exhausted segment for a nonexistent line.
+  Large recomputed voyages now advance directly across hourly source-segment
+  boundaries without introducing false whole-network gaps and GPS-loss events.
+- Add regression coverage proving indexed segment transitions never fall back
+  to a full-file scan.
+
 ## 0.6.14
 
 - Treat `vessels.self` and the configured vessel's canonical Signal K context

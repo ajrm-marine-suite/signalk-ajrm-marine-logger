@@ -4361,6 +4361,10 @@ module.exports = function ajrmMarineLogger(app) {
   }
 
   async function readEnvelopeAtLine(filePath, lineIndex, offsets = playback.offsets) {
+    // A complete index has one offset per line. Reaching its length is EOF,
+    // not an unindexed line: scanning a large segment here can take tens of
+    // seconds before auto-advance is allowed to activate the next segment.
+    if (Array.isArray(offsets) && lineIndex >= offsets.length) return null;
     const offset = offsets?.[lineIndex];
     if (!Number.isFinite(offset)) return readEnvelopeByScan(filePath, lineIndex);
     const line = await readLineAtOffset(filePath, offset);
@@ -4368,6 +4372,15 @@ module.exports = function ajrmMarineLogger(app) {
   }
 
   async function readEnvelopeByScan(filePath, lineIndex) {
+    if (
+      typeof app.ajrmMarineLoggerTestHooks?.beforeReadEnvelopeByScan ===
+      "function"
+    ) {
+      await app.ajrmMarineLoggerTestHooks.beforeReadEnvelopeByScan({
+        filePath,
+        lineIndex,
+      });
+    }
     let found = null;
     let index = 0;
     await readEnvelopes(filePath, async (envelope) => {

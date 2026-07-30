@@ -2405,6 +2405,7 @@ test("recomputed voyage replay pre-indexes every segment and reports cumulative 
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "ajrm-marine-logger-voyage-playlist-"));
   const app = fakeApp();
   const prepared = [];
+  const scannedLines = [];
   app.ajrmMarineLoggerTestHooks = {
     calculationFlushQuietMs: 30,
     calculationFlushMaxMs: 100,
@@ -2413,6 +2414,9 @@ test("recomputed voyage replay pre-indexes every segment and reports cumulative 
       if (name.includes("09-00-01")) {
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
+    },
+    async beforeReadEnvelopeByScan({ filePath, lineIndex }) {
+      scannedLines.push({ filePath, lineIndex });
     },
   };
   const routes = new Map();
@@ -2532,6 +2536,11 @@ test("recomputed voyage replay pre-indexes every segment and reports cumulative 
     assert.ok(
       boundaryElapsedMs < 400,
       `pre-indexed boundary must not include the 250 ms preparation delay (${boundaryElapsedMs} ms)`,
+    );
+    assert.deepEqual(
+      scannedLines,
+      [],
+      "indexed segment EOF must advance directly instead of rescanning the exhausted file",
     );
   } finally {
     plugin.stop();
