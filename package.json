@@ -1,14 +1,13 @@
 {
   "name": "signalk-ajrm-marine-logger",
-  "version": "0.6.17",
-  "description": "Signal K logging and replay utility for AJRM Marine Suite testing.",
+  "version": "0.7.0",
+  "description": "Retired compatibility marker; recording and replay moved to AJRM Marine Capture.",
   "main": "plugin/index.js",
   "scripts": {
-    "test": "node --test test/playback-operation.test.js && node --check plugin/index.js && node --check public/app.js"
+    "test": "node --test test/retired.test.js && node --check plugin/index.js"
   },
   "keywords": [
     "signalk-node-server-plugin",
-    "signalk-webapp",
     "signalk-category-utility",
     "diagnostics",
     "logger",
@@ -34,21 +33,14 @@
   },
   "files": [
     "plugin",
-    "public",
     "README.md",
     "LICENSE"
   ],
-  "signalk-plugin-enabled-by-default": true,
+  "signalk-plugin-enabled-by-default": false,
   "signalk": {
-    "displayName": "AJRM Marine Logger",
-    "appIcon": "./icon.svg",
+    "displayName": "AJRM Marine Logger (retired)",
     "recommends": [
-      "signalk-ajrm-marine-capture",
-      "signalk-ajrm-marine-voyage-viewer"
+      "signalk-ajrm-marine-capture"
     ]
-  },
-  "dependencies": {
-    "adm-zip": "^0.6.0",
-    "yauzl": "^3.4.0"
   }
 }

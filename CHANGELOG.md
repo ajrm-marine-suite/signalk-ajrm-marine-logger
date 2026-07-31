@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0
+
+- Retire this plugin in favour of AJRM Marine Capture v0.7.0.
+- Replace capture/replay runtime code with an inert, disabled-by-default
+  migration marker.
+- Remove the Logger web application and runtime dependencies.
+- Keep old releases and voyage files as historical artefacts; no legacy
+  compatibility logic runs in normal operation.
+
 ## 0.6.17
 
 - Pace replay from one monotonic voyage timeline instead of re-anchoring after
