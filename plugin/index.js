@@ -41,6 +41,11 @@ const GIBIBYTE = 1024 ** 3;
 const REPLAY_CALCULATION_FLUSH_MS = 3000;
 const REPLAY_CALCULATION_FLUSH_MAX_MS = 15000;
 const DEFAULT_REPLAY_ECHO_WINDOW_MS = 15000;
+const PLAYBACK_CLOCK_PUBLISH_INTERVAL_MS = 250;
+const PLAYBACK_STALL_REBASE_THRESHOLD_MS = 2000;
+const PLAYBACK_CATCHUP_LAG_MS = 250;
+const PLAYBACK_TIMING_GRACE_SOURCE_MS = 30000;
+const PLAYBACK_TIMING_MINIMUM_RATIO = 0.9;
 const MAX_VOYAGE_INDEX_BYTES = 2 * 1024 * 1024;
 const AJRM_MARINE_LOGGER_API_REGISTRY = Symbol.for("mcdonaldajr.ajrmMarineLoggerApi");
 const AJRM_MARINE_CAPTURE_API_REGISTRY = Symbol.for("mcdonaldajr.ajrmMarineCaptureApi");
@@ -246,6 +251,13 @@ module.exports = function ajrmMarineLogger(app) {
         return stopRecording(reason);
       },
       status: () => buildStatus(),
+      playbackClock: () => ({
+        active: playback.active || playback.paused,
+        logicalCapturedAt: playback.current || null,
+        rawCapturedAt: playback.rawCapturedAt || null,
+        rate: playback.rate,
+        timing: playbackTimingSummary(),
+      }),
       paths: () => ({ ...paths }),
     };
     app.ajrmMarineLoggerApi = api;
@@ -818,8 +830,9 @@ module.exports = function ajrmMarineLogger(app) {
     }
     if (playback.active || playback.paused) return;
     if (recording?.kind === "recomputed-replay") return;
-    const capturedAt = getDeltaTimestamp(filtered) || new Date().toISOString();
-    const envelope = { capturedAt, delta: filtered };
+    const capturedAt = new Date().toISOString();
+    const sourceTimestamp = getDeltaTimestamp(filtered) || null;
+    const envelope = { capturedAt, sourceTimestamp, delta: filtered };
     writeBufferEnvelope(envelope);
     if (recording) {
       writeRecordingEnvelope(envelope);
@@ -1172,6 +1185,7 @@ module.exports = function ajrmMarineLogger(app) {
       originalVoyageStartedAt: playback.voyageStartedAt,
       requestedBy: String(metadata.requestedBy || "ajrm-marine-logger"),
       liveInputIsolationRequired: true,
+      timingRequired: true,
     };
     playback.filterStats = createFilterStats();
     playback.liveInputIsolation = createLiveInputIsolation();
@@ -1256,6 +1270,7 @@ module.exports = function ajrmMarineLogger(app) {
     playback.sourceAnchorMs = null;
     playback.pacingAnchorMs = null;
     playback.lastLinePacingMs = null;
+    resetPlaybackTiming();
     playbackOperation.invalidate();
   }
 
@@ -2530,6 +2545,7 @@ module.exports = function ajrmMarineLogger(app) {
           filePath,
           directory: sourceDirectory,
         })];
+    const timelineDiagnostics = normalizePlaybackTimelines(prepared);
     indexPlaybackSegments(prepared);
     const initialSegmentIndex = Math.max(
       0,
@@ -2574,13 +2590,14 @@ module.exports = function ajrmMarineLogger(app) {
       sourceCatalog,
       filterStats: createFilterStats(),
       offsets: initialSegment.offsets,
-      times: initialSegment.times,
+      times: initialSegment.pacingTimes,
       segments: prepared,
       segmentIndex: initialSegmentIndex,
       segmentCursor: 0,
       startSegmentIndex: initialSegmentIndex,
       startSegmentCursor: 0,
       preparedComplete: preparedComplete === true,
+      timelineDiagnostics,
     };
     if (initialCapturedAt) {
       const position = findLineAtOrAfter(Date.parse(initialCapturedAt));
@@ -2774,8 +2791,11 @@ module.exports = function ajrmMarineLogger(app) {
     playback.fileName = segment.name;
     playback.filePath = segment.filePath;
     playback.offsets = segment.offsets;
-    playback.times = segment.times;
-    playback.current = Number.isFinite(segment.times?.[segmentCursor])
+    playback.times = segment.pacingTimes || segment.times;
+    playback.current = Number.isFinite(playback.times?.[segmentCursor])
+      ? new Date(playback.times[segmentCursor]).toISOString()
+      : segment.from;
+    playback.rawCapturedAt = Number.isFinite(segment.times?.[segmentCursor])
       ? new Date(segment.times[segmentCursor]).toISOString()
       : segment.from;
     playback.displayFileName = playback.voyageFileName
@@ -2809,7 +2829,10 @@ module.exports = function ajrmMarineLogger(app) {
       preparedNames.add(preparedSegment.name);
       current = preparedSegment;
     }
+    playback.timelineDiagnostics = normalizePlaybackTimelines(prepared);
     indexPlaybackSegments(prepared);
+    const activeSegment = prepared[playback.segmentIndex];
+    playback.times = activeSegment?.pacingTimes || activeSegment?.times || [];
     playback.totalLines = totalPreparedLines(prepared);
     playback.captureFrom = prepared[0]?.from || playback.captureFrom;
     playback.captureTo = prepared[prepared.length - 1]?.to || playback.captureTo;
@@ -3311,11 +3334,13 @@ module.exports = function ajrmMarineLogger(app) {
     playback.sourceAnchorMs = null;
     playback.pacingAnchorMs = null;
     playback.lastLinePacingMs = null;
+    resetPlaybackTiming();
     resetCalculationFlush();
     if (recording?.kind === "recomputed-replay" && recording.replayResult) {
       recording.replayResult.rate = rate;
     }
     const generation = playbackOperation.begin();
+    publishPlaybackClock(true);
     scheduleNextPlaybackLine(0, generation);
     addEvent("playback-started", `${playback.fileName} at ${rate}x`);
     updateProviderStatus();
@@ -3392,6 +3417,7 @@ module.exports = function ajrmMarineLogger(app) {
     if (finishOptions.error) {
       playback.lastError = playbackFailureSummary(finishOptions.error);
     }
+    playback.timingCompletedPacingMs = playbackPacingNowMs();
     playback.previousTs = null;
     playback.sourceAnchorMs = null;
     playback.pacingAnchorMs = null;
@@ -3449,7 +3475,17 @@ module.exports = function ajrmMarineLogger(app) {
     playback.sourceAnchorMs = null;
     playback.pacingAnchorMs = null;
     playback.lastLinePacingMs = null;
+    resetPlaybackTiming();
     playback.lastReason = reason;
+  }
+
+  function resetPlaybackTiming() {
+    playback.timingStartedSourceMs = null;
+    playback.timingStartedPacingMs = null;
+    playback.timingLastSourceMs = null;
+    playback.timingCompletedPacingMs = null;
+    playback.timingStallRebases = 0;
+    playback.timingRebasedMs = 0;
   }
 
   async function seekPlayback(target) {
@@ -3533,11 +3569,19 @@ module.exports = function ajrmMarineLogger(app) {
         return;
       }
 
+      const entryIndex = playback.segmentCursor;
+      const activeSegment = playback.segments?.[playback.segmentIndex];
+      const pacingSourceMs = Number.isFinite(activeSegment?.pacingTimes?.[entryIndex])
+        ? activeSegment.pacingTimes[entryIndex]
+        : Date.parse(entry.capturedAt);
       playback.segmentCursor += 1;
       playback.cursor += 1;
-      playback.current = entry.capturedAt;
-      playback.originalCapturedAt = entry.capturedAt;
-      publishPlaybackClock(true);
+      playback.current = Number.isFinite(pacingSourceMs)
+        ? new Date(pacingSourceMs).toISOString()
+        : entry.capturedAt;
+      playback.originalCapturedAt = playback.current;
+      playback.rawCapturedAt = entry.capturedAt;
+      publishPlaybackClock(true, { force: false });
       const wallTimestamp = new Date().toISOString();
       const replayResult = replayDeltaWithPolicy(entry.delta, {
         timestamp: wallTimestamp,
@@ -3549,7 +3593,8 @@ module.exports = function ajrmMarineLogger(app) {
         if (recording?.kind === "recomputed-replay") {
           writeRecordingEnvelope({
             capturedAt: wallTimestamp,
-            originalCapturedAt: entry.capturedAt,
+            originalCapturedAt: playback.current,
+            rawOriginalCapturedAt: entry.capturedAt,
             replayRole: "sensor-input",
             delta: replayDelta,
           });
@@ -3573,15 +3618,19 @@ module.exports = function ajrmMarineLogger(app) {
       }
       stats.playbackSent += 1;
 
-      const currentMs = Date.parse(entry.capturedAt);
+      const currentMs = pacingSourceMs;
       playback.lastLinePacingMs = playbackPacingNowMs();
       if (Number.isFinite(currentMs)) {
         playback.previousTs = currentMs;
-        // Anchor pacing to the most recently emitted measurement. If Signal K
-        // or the host stalls, move the remaining replay later instead of
-        // emitting a catch-up burst that compresses recorded sensor gaps.
-        playback.sourceAnchorMs = currentMs;
-        playback.pacingAnchorMs = playback.lastLinePacingMs;
+        if (
+          !Number.isFinite(playback.sourceAnchorMs) ||
+          !Number.isFinite(playback.pacingAnchorMs)
+        ) {
+          playback.sourceAnchorMs = currentMs;
+          playback.pacingAnchorMs = playback.lastLinePacingMs;
+        }
+        updatePlaybackTiming(currentMs, playback.lastLinePacingMs);
+        rebasePlaybackAfterGenuineStall(currentMs, playback.lastLinePacingMs);
       }
       nextDelayMs = playbackDelayToTimestamp(nextPlaybackSourceMs());
       if (nextDelayMs > 0 || playbackPacingNowMs() - batchStartedMs >= 40) break;
@@ -3600,6 +3649,45 @@ module.exports = function ajrmMarineLogger(app) {
     });
   }
 
+  function rebasePlaybackAfterGenuineStall(currentSourceMs, pacingNowMs) {
+    if (playback.rate === "max") return;
+    const numericRate = Number(playback.rate || 1);
+    if (
+      !Number.isFinite(currentSourceMs) ||
+      !Number.isFinite(pacingNowMs) ||
+      !Number.isFinite(playback.sourceAnchorMs) ||
+      !Number.isFinite(playback.pacingAnchorMs) ||
+      !Number.isFinite(numericRate) ||
+      numericRate <= 0
+    ) {
+      return;
+    }
+    const targetPacingMs =
+      playback.pacingAnchorMs +
+      Math.max(0, currentSourceMs - playback.sourceAnchorMs) / numericRate;
+    const lagMs = pacingNowMs - targetPacingMs;
+    if (lagMs <= PLAYBACK_STALL_REBASE_THRESHOLD_MS) return;
+    const shiftMs = lagMs - PLAYBACK_CATCHUP_LAG_MS;
+    playback.pacingAnchorMs += shiftMs;
+    playback.timingStallRebases += 1;
+    playback.timingRebasedMs += shiftMs;
+  }
+
+  function updatePlaybackTiming(sourceMs, pacingNowMs) {
+    if (!Number.isFinite(sourceMs) || !Number.isFinite(pacingNowMs)) return;
+    if (
+      !Number.isFinite(playback.timingStartedSourceMs) ||
+      !Number.isFinite(playback.timingStartedPacingMs)
+    ) {
+      playback.timingStartedSourceMs = sourceMs;
+      playback.timingStartedPacingMs = pacingNowMs;
+    }
+    playback.timingLastSourceMs = Math.max(
+      Number(playback.timingLastSourceMs || sourceMs),
+      sourceMs,
+    );
+  }
+
   function playbackPacingNowMs() {
     const testClock = app.ajrmMarineLoggerTestHooks?.monotonicNowMs;
     if (typeof testClock === "function") {
@@ -3611,10 +3699,12 @@ module.exports = function ajrmMarineLogger(app) {
 
   function nextPlaybackSourceMs() {
     const currentSegment = playback.segments?.[playback.segmentIndex];
-    const currentTime = currentSegment?.times?.[playback.segmentCursor];
+    const currentTimes = currentSegment?.pacingTimes || currentSegment?.times;
+    const currentTime = currentTimes?.[playback.segmentCursor];
     if (Number.isFinite(currentTime)) return currentTime;
     const nextSegment = playback.segments?.[playback.segmentIndex + 1];
-    return nextSegment?.times?.[0];
+    const nextTimes = nextSegment?.pacingTimes || nextSegment?.times;
+    return nextTimes?.[0];
   }
 
   async function autoAdvancePlaybackSegment() {
@@ -3645,6 +3735,7 @@ module.exports = function ajrmMarineLogger(app) {
         directory: playback.sourceDirectory,
       });
       playback.segments.push(preparedSegment);
+      playback.timelineDiagnostics = normalizePlaybackTimelines(playback.segments);
       indexPlaybackSegments(playback.segments);
       playback.totalLines = totalPreparedLines();
       playback.captureTo = latestIsoTimestamp(
@@ -4414,7 +4505,7 @@ module.exports = function ajrmMarineLogger(app) {
     const segments = playback.segments || [];
     for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += 1) {
       const segment = segments[segmentIndex];
-      const times = segment.times || [];
+      const times = segment.pacingTimes || segment.times || [];
       if (!times.length || times[times.length - 1] < targetMs) continue;
       let low = 0;
       let high = times.length - 1;
@@ -4444,8 +4535,8 @@ module.exports = function ajrmMarineLogger(app) {
       segmentIndex,
       segmentCursor,
       cursor: Number(segment?.baseCursor || 0) + segmentCursor,
-      capturedAt: Number.isFinite(segment?.times?.[segmentCursor])
-        ? new Date(segment.times[segmentCursor]).toISOString()
+      capturedAt: Number.isFinite((segment?.pacingTimes || segment?.times)?.[segmentCursor])
+        ? new Date((segment.pacingTimes || segment.times)[segmentCursor]).toISOString()
         : segment?.from || playback.from,
     };
   }
@@ -4508,6 +4599,15 @@ module.exports = function ajrmMarineLogger(app) {
       sourceAnchorMs: null,
       pacingAnchorMs: null,
       lastLinePacingMs: null,
+      rawCapturedAt: null,
+      lastPlaybackClockPublishedMs: null,
+      timingStartedSourceMs: null,
+      timingStartedPacingMs: null,
+      timingLastSourceMs: null,
+      timingCompletedPacingMs: null,
+      timingStallRebases: 0,
+      timingRebasedMs: 0,
+      timelineDiagnostics: createTimelineDiagnostics(),
       timer: null,
       lastReason: "not loaded",
       lastError: null,
@@ -4584,6 +4684,8 @@ module.exports = function ajrmMarineLogger(app) {
       originalCapturedAt: playback.originalCapturedAt,
       sourceFilterStats: playback.filterStats,
       liveInputIsolation: playback.liveInputIsolation,
+      timing: playbackTimingSummary(),
+      timelineDiagnostics: { ...playback.timelineDiagnostics },
       resultSegments,
       coverage,
       calculationFlushUntil: Number.isFinite(playback.calculationFlushUntilMs)
@@ -4618,10 +4720,13 @@ module.exports = function ajrmMarineLogger(app) {
       mode: playback.mode,
       replayMode: playbackModeContract(playback.mode),
       originalCapturedAt: playback.originalCapturedAt || playback.current,
+      rawCapturedAt: playback.rawCapturedAt || null,
       sourcePolicy: playback.sourcePolicy,
       sourceCatalog: playback.sourceCatalog,
       sourceFilterStats: playback.filterStats,
       liveInputIsolation: playback.liveInputIsolation,
+      timing: playbackTimingSummary(),
+      timelineDiagnostics: { ...playback.timelineDiagnostics },
       coverage: buildPlaybackCoverage(),
       calculationFlushUntil: Number.isFinite(playback.calculationFlushUntilMs)
         ? new Date(playback.calculationFlushUntilMs).toISOString()
@@ -4724,7 +4829,33 @@ module.exports = function ajrmMarineLogger(app) {
     };
   }
 
-  function publishPlaybackClock(active) {
+  function playbackTimingSummary() {
+    return summarizePlaybackTiming({
+      requestedRate: playback.rate,
+      startedSourceMs: playback.timingStartedSourceMs,
+      lastSourceMs: playback.timingLastSourceMs,
+      startedPacingMs: playback.timingStartedPacingMs,
+      completedPacingMs: playback.timingCompletedPacingMs,
+      currentPacingMs: playbackPacingNowMs(),
+      complete: playback.lastReason === "end of capture",
+      stallRebases: playback.timingStallRebases,
+      rebasedMs: playback.timingRebasedMs,
+      timelineDiagnostics: playback.timelineDiagnostics,
+    });
+  }
+
+  function publishPlaybackClock(active, { force = true } = {}) {
+    const pacingNowMs = playbackPacingNowMs();
+    if (
+      active &&
+      !force &&
+      Number.isFinite(playback.lastPlaybackClockPublishedMs) &&
+      pacingNowMs - playback.lastPlaybackClockPublishedMs <
+        PLAYBACK_CLOCK_PUBLISH_INTERVAL_MS
+    ) {
+      return;
+    }
+    playback.lastPlaybackClockPublishedMs = pacingNowMs;
     app.handleMessage(plugin.id, {
       context: "vessels.self",
       updates: [
@@ -4737,6 +4868,8 @@ module.exports = function ajrmMarineLogger(app) {
                 ? {
                     active: true,
                     capturedAt: playback.current,
+                    logicalCapturedAt: playback.current,
+                    rawCapturedAt: playback.rawCapturedAt,
                     fileName: playback.fileName,
                     displayFileName: playback.displayFileName || playback.fileName,
                     sourceKind: playback.sourceKind,
@@ -4760,6 +4893,8 @@ module.exports = function ajrmMarineLogger(app) {
                     resultCapture: recording?.kind === "recomputed-replay",
                     playing: playback.active,
                     rate: playback.rate,
+                    timing: playbackTimingSummary(),
+                    timelineDiagnostics: { ...playback.timelineDiagnostics },
                     lastError: playback.lastError ? { ...playback.lastError } : null,
                   }
                 : {
@@ -4773,6 +4908,8 @@ module.exports = function ajrmMarineLogger(app) {
                     warmupActive: false,
                     includeFullBackfill: playback.includeFullBackfill,
                     originalCapturedAt: playback.originalCapturedAt || playback.current,
+                    logicalCapturedAt: playback.current,
+                    rawCapturedAt: playback.rawCapturedAt,
                     mode: playback.mode,
                     replayMode: playbackModeContract(playback.mode),
                     sourcePolicy: playback.sourcePolicy,
@@ -4785,6 +4922,9 @@ module.exports = function ajrmMarineLogger(app) {
                       Number.isFinite(playback.calculationFlushUntilMs) &&
                       Date.now() <= playback.calculationFlushUntilMs,
                     resultCapture: recording?.kind === "recomputed-replay",
+                    rate: playback.rate,
+                    timing: playbackTimingSummary(),
+                    timelineDiagnostics: { ...playback.timelineDiagnostics },
                     lastError: playback.lastError ? { ...playback.lastError } : null,
                   },
             },
@@ -5222,6 +5362,129 @@ function playbackModeContract(mode) {
   return mode === PLAYBACK_MODE_SENSOR_SOURCES ? "sensor-only" : "standard";
 }
 
+function createTimelineDiagnostics() {
+  return {
+    contract: "monotonic-arrival-timeline-v1",
+    normalized: false,
+    records: 0,
+    rawTimestampRegressions: 0,
+    rawBackwardMs: 0,
+    rawFrom: null,
+    rawTo: null,
+    logicalFrom: null,
+    logicalTo: null,
+  };
+}
+
+function normalizePlaybackTimelines(segments) {
+  const diagnostics = createTimelineDiagnostics();
+  let lastLogicalMs = null;
+  let firstLogicalMs = null;
+  let rawFromMs = null;
+  let rawToMs = null;
+  for (const segment of segments || []) {
+    segment.pacingTimes = [];
+    for (const rawValue of segment.times || []) {
+      const rawMs = Number(rawValue);
+      if (!Number.isFinite(rawMs)) {
+        segment.pacingTimes.push(lastLogicalMs);
+        continue;
+      }
+      diagnostics.records += 1;
+      rawFromMs = Number.isFinite(rawFromMs) ? Math.min(rawFromMs, rawMs) : rawMs;
+      rawToMs = Number.isFinite(rawToMs) ? Math.max(rawToMs, rawMs) : rawMs;
+      if (Number.isFinite(lastLogicalMs) && rawMs < lastLogicalMs) {
+        diagnostics.rawTimestampRegressions += 1;
+        diagnostics.rawBackwardMs += lastLogicalMs - rawMs;
+      }
+      lastLogicalMs = Number.isFinite(lastLogicalMs)
+        ? Math.max(lastLogicalMs, rawMs)
+        : rawMs;
+      if (!Number.isFinite(firstLogicalMs)) firstLogicalMs = lastLogicalMs;
+      segment.pacingTimes.push(lastLogicalMs);
+    }
+  }
+  diagnostics.normalized = diagnostics.records > 0;
+  diagnostics.rawBackwardMs = Math.round(diagnostics.rawBackwardMs);
+  diagnostics.rawFrom = Number.isFinite(rawFromMs)
+    ? new Date(rawFromMs).toISOString()
+    : null;
+  diagnostics.rawTo = Number.isFinite(rawToMs)
+    ? new Date(rawToMs).toISOString()
+    : null;
+  diagnostics.logicalFrom = Number.isFinite(firstLogicalMs)
+    ? new Date(firstLogicalMs).toISOString()
+    : null;
+  diagnostics.logicalTo = Number.isFinite(lastLogicalMs)
+    ? new Date(lastLogicalMs).toISOString()
+    : null;
+  return diagnostics;
+}
+
+function summarizePlaybackTiming({
+  requestedRate,
+  startedSourceMs,
+  lastSourceMs,
+  startedPacingMs,
+  completedPacingMs,
+  currentPacingMs,
+  complete = false,
+  stallRebases = 0,
+  rebasedMs = 0,
+  timelineDiagnostics = {},
+} = {}) {
+  const numericRate = requestedRate === "max" ? null : Number(requestedRate || 1);
+  const sourceElapsedMs =
+    Number.isFinite(startedSourceMs) && Number.isFinite(lastSourceMs)
+      ? Math.max(0, lastSourceMs - startedSourceMs)
+      : 0;
+  const pacingEndMs = Number.isFinite(completedPacingMs)
+    ? completedPacingMs
+    : currentPacingMs;
+  const wallElapsedMs =
+    Number.isFinite(startedPacingMs) && Number.isFinite(pacingEndMs)
+      ? Math.max(0, pacingEndMs - startedPacingMs)
+      : 0;
+  const effectiveRate =
+    sourceElapsedMs > 0 && wallElapsedMs > 0
+      ? sourceElapsedMs / wallElapsedMs
+      : null;
+  const effectiveRatio =
+    Number.isFinite(effectiveRate) &&
+    Number.isFinite(numericRate) &&
+    numericRate > 0
+      ? effectiveRate / numericRate
+      : null;
+  const enoughEvidence =
+    complete === true || sourceElapsedMs >= PLAYBACK_TIMING_GRACE_SOURCE_MS;
+  const valid = requestedRate === "max"
+    ? true
+    : enoughEvidence && Number.isFinite(effectiveRatio)
+      ? effectiveRatio >= PLAYBACK_TIMING_MINIMUM_RATIO
+      : null;
+  return {
+    contract: "replay-effective-rate-v1",
+    requestedRate,
+    sourceElapsedMs: Math.round(sourceElapsedMs),
+    wallElapsedMs: Math.round(wallElapsedMs),
+    effectiveRate: Number.isFinite(effectiveRate)
+      ? Number(effectiveRate.toFixed(4))
+      : null,
+    effectiveRatio: Number.isFinite(effectiveRatio)
+      ? Number(effectiveRatio.toFixed(4))
+      : null,
+    minimumRatio: PLAYBACK_TIMING_MINIMUM_RATIO,
+    enoughEvidence,
+    valid,
+    stallRebases: Number(stallRebases || 0),
+    rebasedMs: Math.round(Number(rebasedMs || 0)),
+    rawTimestampRegressions: Number(
+      timelineDiagnostics?.rawTimestampRegressions || 0,
+    ),
+    rawBackwardMs: Number(timelineDiagnostics?.rawBackwardMs || 0),
+  };
+}
+
 function calculatePlaybackDelayMs({
   nextSourceMs,
   sourceAnchorMs,
@@ -5304,6 +5567,8 @@ async function readLineAtOffset(filePath, offset) {
 
 module.exports._test = {
   calculatePlaybackDelayMs,
+  createTimelineDiagnostics,
+  normalizePlaybackTimelines,
   normalizePlaybackRate,
   partitionNormalizedCourseProjectionEchoes,
   replayDeltaAsLiveInputs,
@@ -5311,4 +5576,5 @@ module.exports._test = {
   createSourcePolicy,
   normalizeSensorSourceIds,
   shouldReplayInputPath,
+  summarizePlaybackTiming,
 };

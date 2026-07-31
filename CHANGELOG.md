@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.17
+
+- Pace replay from one monotonic voyage timeline instead of re-anchoring after
+  every delta. Scheduler delays now catch up naturally rather than multiplying
+  every later interval.
+- Record live delta arrival time as the envelope clock and retain the embedded
+  Signal K time separately as `sourceTimestamp`.
+- Normalize legacy recordings with backward envelope timestamps without
+  accumulating their backwards duration, while publishing raw-timeline
+  diagnostics for audit.
+- Publish requested and measured effective replay rate, require an explicit
+  timing-valid result for recomputed capture, and expose replay progress and
+  timing clearly in the web app.
+- Throttle playback-clock deltas to four per second and expose an in-process
+  logical replay clock for time-sensitive plugins.
+
 ## 0.6.16
 
 - Recognise Signal K's mixed course projection delta: a fresh `courseApi`

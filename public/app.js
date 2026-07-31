@@ -38,6 +38,8 @@ const elements = {
   sensorSourceIds: document.getElementById("sensorSourceIds"),
   playbackTime: document.getElementById("playbackTime"),
   playbackProgress: document.getElementById("playbackProgress"),
+  playbackProgressBar: document.getElementById("playbackProgressBar"),
+  playbackTiming: document.getElementById("playbackTiming"),
   sourcePolicyStatus: document.getElementById("sourcePolicyStatus"),
   resultCaptureStatus: document.getElementById("resultCaptureStatus"),
   seekSlider: document.getElementById("seekSlider"),
@@ -305,6 +307,35 @@ function renderPlayback() {
     : playback.loaded
     ? `${playback.cursor || 0} / ${playback.totalLines || 0} deltas (${playbackFailureText}${warmupText})`
     : "No recording loaded";
+  const replayableLines = Math.max(
+    0,
+    Number(playback.totalLines || 0) - Number(playback.startCursor || 0),
+  );
+  const replayedLines = Math.max(
+    0,
+    Number(playback.cursor || 0) - Number(playback.startCursor || 0),
+  );
+  elements.playbackProgressBar.value = replayableLines > 0
+    ? Math.min(1, replayedLines / replayableLines)
+    : 0;
+  const timing = playback.timing || {};
+  const effectiveRate = Number.isFinite(timing.effectiveRate)
+    ? `${timing.effectiveRate.toFixed(2)}x effective`
+    : "measuring effective speed";
+  const timingValidity = timing.valid === true
+    ? "valid"
+    : timing.valid === false
+      ? `INVALID (minimum ${(Number(timing.minimumRatio || 0.9) * 100).toFixed(0)}% of requested speed)`
+      : "awaiting sufficient data";
+  elements.playbackTiming.textContent = playback.loaded
+    ? `${playback.rate || 1}x requested · ${effectiveRate} · ${timingValidity}${
+        timing.stallRebases
+          ? ` · ${timing.stallRebases} scheduler stall rebase${
+              timing.stallRebases === 1 ? "" : "s"
+            }`
+          : ""
+      }`
+    : "-";
   if (playback.loaded && document.activeElement !== elements.playbackMode) {
     elements.playbackMode.value = playback.mode || "standard";
   }

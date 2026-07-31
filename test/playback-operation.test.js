@@ -16,10 +16,12 @@ const {
 const {
   calculatePlaybackDelayMs,
   createSourcePolicy,
+  normalizePlaybackTimelines,
   partitionNormalizedCourseProjectionEchoes,
   replayDeltaAsLiveInputs,
   replayDeltaWithPolicy,
   shouldReplayInputPath,
+  summarizePlaybackTiming,
 } = startPlugin._test;
 
 test("mixed courseApi projection separates retained YDEN next-point echo", () => {
@@ -117,17 +119,17 @@ test("numeric playback rate stops delaying once playback is behind schedule", ()
   );
 });
 
-test("1x playback preserves the next recorded interval after a scheduler stall", async () => {
+test("1x playback catches up after a scheduler stall instead of adding every later interval", async () => {
   const root = await fs.mkdtemp(path.join(
     os.tmpdir(),
     "ajrm-marine-logger-non-catching-up-replay-",
   ));
   const app = fakeApp();
   const routes = new Map();
-  let pacingNowMs = 1000;
+  let pacingOffsetMs = 0;
   const injectedAt = [];
   app.ajrmMarineLoggerTestHooks = {
-    monotonicNowMs: () => pacingNowMs,
+    monotonicNowMs: () => performance.now() + pacingOffsetMs,
   };
   app.handleMessage = (_pluginId, delta) => {
     app.messages.push(delta);
@@ -139,7 +141,7 @@ test("1x playback preserves the next recorded interval after a scheduler stall",
     injectedAt.push(performance.now());
     if (injectedAt.length === 2) {
       // Model an event-loop stall after the second recorded measurement.
-      pacingNowMs += 500;
+      pacingOffsetMs += 500;
     }
   };
   const plugin = startPlugin(app);
@@ -175,14 +177,54 @@ test("1x playback preserves the next recorded interval after a scheduler stall",
 
     assert.equal(injectedAt.length, 3);
     assert.ok(
-      injectedAt[2] - injectedAt[1] >= 35,
-      `expected the final 50 ms recorded interval to survive the stall; observed ${
+      injectedAt[2] - injectedAt[1] < 35,
+      `expected playback to catch up after the stall; observed ${
         injectedAt[2] - injectedAt[1]
       } ms`,
     );
   } finally {
     plugin.stop();
   }
+});
+
+test("legacy timestamp regressions are normalized without accumulating backwards time", () => {
+  const segments = [
+    { times: [1000, 2000, 500, 2500] },
+    { times: [2400, 3000] },
+  ];
+  const diagnostics = normalizePlaybackTimelines(segments);
+  assert.deepEqual(segments[0].pacingTimes, [1000, 2000, 2000, 2500]);
+  assert.deepEqual(segments[1].pacingTimes, [2500, 3000]);
+  assert.equal(diagnostics.rawTimestampRegressions, 2);
+  assert.equal(diagnostics.rawBackwardMs, 1600);
+  assert.equal(diagnostics.logicalFrom, "1970-01-01T00:00:01.000Z");
+  assert.equal(diagnostics.logicalTo, "1970-01-01T00:00:03.000Z");
+});
+
+test("recomputed replay timing fails closed when effective 1x rate is too slow", () => {
+  const timing = summarizePlaybackTiming({
+    requestedRate: 1,
+    startedSourceMs: 0,
+    lastSourceMs: 60_000,
+    startedPacingMs: 0,
+    completedPacingMs: 120_000,
+    complete: true,
+  });
+  assert.equal(timing.effectiveRate, 0.5);
+  assert.equal(timing.valid, false);
+});
+
+test("recomputed replay timing accepts effective 1x playback within tolerance", () => {
+  const timing = summarizePlaybackTiming({
+    requestedRate: 1,
+    startedSourceMs: 0,
+    lastSourceMs: 60_000,
+    startedPacingMs: 0,
+    completedPacingMs: 62_000,
+    complete: true,
+  });
+  assert.equal(timing.effectiveRate, 0.9677);
+  assert.equal(timing.valid, true);
 });
 
 test("max playback never applies timing delay", () => {

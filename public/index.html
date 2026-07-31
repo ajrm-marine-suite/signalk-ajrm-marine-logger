@@ -135,9 +135,11 @@
             <div><dt>Loaded</dt><dd id="loadedFile">-</dd></div>
             <div><dt>Recording Time</dt><dd id="playbackTime">-</dd></div>
             <div><dt>Progress</dt><dd id="playbackProgress">-</dd></div>
+            <div><dt>Timing</dt><dd id="playbackTiming">-</dd></div>
             <div><dt>Source policy</dt><dd id="sourcePolicyStatus">-</dd></div>
             <div><dt>Result capture</dt><dd id="resultCaptureStatus">-</dd></div>
           </dl>
+          <progress id="playbackProgressBar" max="1" value="0"></progress>
           <input id="seekSlider" type="range" min="0" max="1000" value="0" />
           <div class="transport">
             <button id="restartButton" type="button">Restart</button>
